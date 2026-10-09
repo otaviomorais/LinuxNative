@@ -2,7 +2,8 @@
 
 An experimental Debian/Linux compatibility runtime for **Android ARM64 without
 root or ptrace**. Milestone 0 proves direct syscall rewriting for a deliberately
-small class of static ELF programs. It does **not** yet run arbitrary Debian
+small class of static ELF programs. The next experiment adds a separately
+compiled C file inspector. It does **not** yet run arbitrary Debian
 packages, BusyBox, Python, Go, or an entire Debian userland.
 
 The loader replaces each supported guest `svc #0` with a direct branch to an
@@ -14,12 +15,13 @@ QEMU is used only to test ARM64 code on x86_64 development machines.
 ## Current evidence
 
 - Cross-compiled with GCC 14 and executed with QEMU user mode 10 on Linux x86_64.
-- 23 integration tests pass: actual file redirection, negative errno, exit
-  status, integer/NEON/flags preservation, embedded instruction-looking data,
-  unchanged input ELF, and malformed/unsupported ELF rejection.
-- Android device execution is **pending**, including the user's Poco F3
-  (reported Android 17). Linux/QEMU results do not establish Android compatibility.
-- The native ARM64 CI workflow is provided but has not been run remotely.
+- Milestone 0's 23 tests passed on the user's Poco F3 according to their report:
+  Android 17 / SDK 37, kernel 4.19, 4 KiB pages, Clang 21.1.8 in Termux.
+- The current suite has 32 tests, adding direct-vs-runtime execution of a C
+  program, file metadata, seeking and argument handling to the original checks.
+  The expanded suite passes under QEMU; its Android run is pending.
+- See [validation evidence and limits](docs/validation.md). Other devices and
+  16 KiB pages remain unverified. Remote CI results have not been verified here.
 
 ## Build and test
 
@@ -83,7 +85,21 @@ register preservation and error behavior, then reads `/etc/linuxnative-probe.txt
 from the selected root and writes its contents to stdout. The original ELF is
 never modified on disk.
 
-## Milestone 0 contract
+### C program example
+
+The same file inspector can run directly or through LinuxNative. In the cloud:
+
+```sh
+qemu-aarch64 build/file-scan "$PWD/build/demo-root/etc/linuxnative-probe.txt"
+qemu-aarch64 build/lnative --root build/demo-root build/file-scan /etc/linuxnative-probe.txt
+```
+
+Both should print the same JSON metadata and content fingerprint. On the phone,
+omit `qemu-aarch64` after building with `tools/test-termux.sh`. The C executable
+has no dependency on the runtime but uses a custom linker layout and no libc;
+this is a step toward existing Debian binaries, not general support for them.
+
+## Current prototype contract
 
 - Trusted, little-endian AArch64 `ET_EXEC`; static, non-PIE, without TLS.
 - Complete AArch64 `$x`/`$d` mapping symbols, retained section/symbol tables,
@@ -94,7 +110,10 @@ never modified on disk.
   self-modifying code, SVE/SME, or modifications to the host TLS pointer.
 - Valid guest pointers and aligned, sufficiently sized guest stacks.
 - Syscalls: `openat` (absolute paths, read-only, optionally `O_CLOEXEC`), `read`,
-  `write`, `close`, `exit`, `exit_group`. Others return raw `-ENOSYS`.
+  `write`, `close`, `fstat`, `lseek`, `exit`, `exit_group`.
+  Others return raw `-ENOSYS`. Metadata is converted to the Linux AArch64 ABI.
+- CLI: `lnative [--verbose] --root DIRECTORY STATIC_ELF [ARG...]`.
+  Arguments are copied to a 16-byte-aligned guest stack with a bounded budget.
 - Unsupported open modes and relative paths return `-EOPNOTSUPP`; `..` components
   return `-EACCES`. No claim of a complete Linux filesystem or process ABI.
 
@@ -109,9 +128,10 @@ still require validation in the actual Android app context.
 
 ## Next milestones
 
-1. Validate this mechanism on Android hardware, including Bionic, executable
-   memory policy, instruction-cache coherence, and 4/16 KiB pages.
-2. Expand the tested syscall and process ABI, with differential Linux tests.
+1. Validate the expanded C-program suite on the Poco F3, then other Android
+   configurations including devices with 16 KiB pages.
+2. Extend the syscall/process ABI toward a small independently built libc-linked
+   application, guided by differential tests and explicit support limits.
 3. Add a loader and rewriting strategy for ordinary dynamic/stripped binaries.
 4. Address threads, signals, exec, and code generated at runtime.
 5. Measure correctness and performance against native Linux and PRoot workloads.

@@ -53,8 +53,10 @@ This is a synchronous, single-thread experiment, not signal-safe Android ABI
 support. Guest code must not alter TPIDR_EL0 or otherwise corrupt host TLS.
 
 There is one host process and a separate guarded guest stack. The initial stack
-contains argc/argv, an empty environment, AT_PAGESZ and AT_NULL; it is not a
-complete Linux auxiliary vector. The supported exit syscalls terminate this
+contains argc/argv (including supplied arguments), an empty environment,
+AT_PAGESZ and AT_NULL; it is not a complete Linux auxiliary vector. Arguments
+and their pointer table may occupy at most half of the 1 MiB stack; the initial
+SP is aligned to 16 bytes. The supported exit syscalls terminate this
 process with the guest's status.
 
 ## Compatibility policy
@@ -63,6 +65,12 @@ An absolute guest file path is resolved relative to an open root-directory FD.
 The host libc performs allowed operations and its `-1`/errno convention is
 converted to Linux's raw negative errno convention. The runtime returns
 `-ENOSYS` for unsupported syscalls instead of forwarding unknown operations.
+
+The C-program experiment adds `lseek` with signed 64-bit offsets and `fstat`.
+File metadata is explicitly marshalled from the host libc's `struct stat` into
+the 128-byte Linux AArch64 UAPI layout defined in `include/linux_aarch64.h`.
+Host structure layout is not assumed to equal the guest's. Direct execution
+of the same guest exercises the kernel's actual ABI for comparison.
 
 This is compatibility routing, not confinement. Guest pointers are trusted;
 invalid non-null pathname pointers can crash the process. File descriptors are

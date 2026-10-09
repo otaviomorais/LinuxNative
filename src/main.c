@@ -16,8 +16,8 @@ int main(int argc, char **argv)
         ++argv;
         --argc;
     }
-    if (argc != 4 || strcmp(argv[1], "--root")) {
-        fprintf(stderr, "usage: lnative [--verbose] --root DIRECTORY STATIC_ELF\n"
+    if (argc < 4 || strcmp(argv[1], "--root")) {
+        fprintf(stderr, "usage: lnative [--verbose] --root DIRECTORY STATIC_ELF [ARG...]\n"
                         "Experimental: trusted AArch64 probes only; not a sandbox.\n");
         return 2;
     }
@@ -28,6 +28,17 @@ int main(int argc, char **argv)
         return 1;
     size_t page = (size_t)sysconf(_SC_PAGESIZE);
     size_t stack_size = 1024 * 1024;
+    size_t guest_argc = (size_t)argc - 3;
+    /* Reserve at least half of the stack for execution, including the gateway. */
+    size_t argument_size = (guest_argc + 7) * sizeof(uint64_t) + 15;
+    for (size_t i = 0; i < guest_argc; ++i) {
+        size_t length = strlen(argv[3 + i]) + 1;
+        if (argument_size > stack_size / 2 || length > stack_size / 2 - argument_size) {
+            fprintf(stderr, "lnative: guest arguments exceed stack budget\n");
+            return 1;
+        }
+        argument_size += length;
+    }
     void *stack = mmap(NULL, stack_size + 2 * page, PROT_NONE,
                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (stack == MAP_FAILED ||
@@ -36,15 +47,23 @@ int main(int argc, char **argv)
         return 1;
     }
     uintptr_t top = (uintptr_t)stack + page + stack_size;
-    size_t name_len = strlen(argv[3]) + 1;
-    top -= name_len;
-    memcpy((void *)top, argv[3], name_len);
-    uintptr_t name = top;
-    top &= ~(uintptr_t)15;
     /* Minimal process stack, not the complete Linux process ABI. */
-    uint64_t initial[] = {1, name, 0, 0, AT_PAGESZ, page, AT_NULL, 0};
-    top -= sizeof(initial);
-    memcpy((void *)top, initial, sizeof(initial));
+    size_t words = guest_argc + 7;
+    uint64_t *initial = calloc(words, sizeof(*initial));
+    if (!initial) { perror("lnative: arguments"); return 1; }
+    initial[0] = guest_argc;
+    for (size_t i = 0; i < guest_argc; ++i) {
+        size_t length = strlen(argv[3 + i]) + 1;
+        top -= length;
+        memcpy((void *)top, argv[3 + i], length);
+        initial[i + 1] = top;
+    }
+    initial[guest_argc + 3] = AT_PAGESZ;
+    initial[guest_argc + 4] = page;
+    initial[guest_argc + 5] = AT_NULL;
+    top = (top - words * sizeof(*initial)) & ~(uintptr_t)15;
+    memcpy((void *)top, initial, words * sizeof(*initial));
+    free(initial);
     if (verbose)
         fprintf(stderr, "lnative: patched %zu SVC sites; entering guest\n", image.sites);
     ln_enter(image.entry, top);

@@ -16,6 +16,9 @@ cd "$REPO"
 mkdir -p build
 {
     date -u '+UTC %Y-%m-%dT%H:%M:%SZ'
+    if command -v git >/dev/null 2>&1; then
+        printf 'Commit: '; git rev-parse HEAD 2>/dev/null || printf 'unavailable\n'
+    fi
     uname -smr
     if command -v getprop >/dev/null 2>&1; then
         printf 'Model: '; getprop ro.product.model
@@ -26,7 +29,7 @@ mkdir -p build
     clang --version
 } > build/device-info.txt
 # Rebuild only generated targets, to avoid reusing a cloud/glibc executable.
-rm -f build/lnative build/probe
+rm -f build/lnative build/probe build/file-scan build/file-abi
 if make CC=clang LDFLAGS= > build/device-build.log 2>&1; then
     cat build/device-build.log
 else

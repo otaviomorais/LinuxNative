@@ -1,14 +1,18 @@
 #define _GNU_SOURCE
 #include "lnative.h"
+#include "../include/linux_aarch64.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 static int root_fd = -1;
 static int trace_calls;
+
+_Static_assert(sizeof(off_t) == 8, "64-bit host file offsets required");
 
 int ln_runtime_init(const char *root, int verbose)
 {
@@ -32,7 +36,7 @@ static long guest_open(const uint64_t *r)
     if (path[0] != '/')
         return -EOPNOTSUPP;
     if (r[2] & ~(uint64_t)O_CLOEXEC)
-        return -EOPNOTSUPP; /* read-only files in milestone 0 */
+        return -EOPNOTSUPP; /* read-only files in the current prototype */
     for (const char *p = path; *p;) {
         while (*p == '/') ++p;
         const char *end = p;
@@ -47,27 +51,57 @@ static long guest_open(const uint64_t *r)
     return fd < 0 ? -errno : fd;
 }
 
+static long guest_fstat(const uint64_t *r)
+{
+    if (!r[1]) return -EFAULT;
+    struct stat host;
+    if (fstat((int)r[0], &host)) return -errno;
+    uint64_t links = host.st_nlink;
+    int64_t block_size = host.st_blksize;
+    if (links > UINT32_MAX || block_size > INT32_MAX || block_size < 0)
+        return -EOVERFLOW;
+    /* Do not memcpy host struct stat: Bionic/glibc layout is not our ABI. */
+    struct ln_stat guest = {
+        .dev = host.st_dev, .ino = host.st_ino, .mode = host.st_mode,
+        .nlink = host.st_nlink, .uid = host.st_uid, .gid = host.st_gid,
+        .rdev = host.st_rdev, .size = host.st_size, .blksize = host.st_blksize,
+        .blocks = host.st_blocks,
+        .atime_sec = host.st_atim.tv_sec, .atime_nsec = host.st_atim.tv_nsec,
+        .mtime_sec = host.st_mtim.tv_sec, .mtime_nsec = host.st_mtim.tv_nsec,
+        .ctime_sec = host.st_ctim.tv_sec, .ctime_nsec = host.st_ctim.tv_nsec
+    };
+    memcpy((void *)(uintptr_t)r[1], &guest, sizeof(guest));
+    return 0;
+}
+
 uint64_t ln_dispatch(uint64_t *r)
 {
     long result;
     switch (r[8]) {
-    case 56: /* AArch64 openat; an absolute path ignores dirfd. */
+    case LN_OPENAT: /* An absolute path ignores dirfd. */
         result = guest_open(r);
         break;
-    case 57:
+    case LN_CLOSE:
         result = close((int)r[0]);
         if (result < 0) result = -errno;
         break;
-    case 63:
+    case LN_LSEEK:
+        result = lseek((int)r[0], (off_t)(int64_t)r[1], (int)r[2]);
+        if (result < 0) result = -errno;
+        break;
+    case LN_FSTAT:
+        result = guest_fstat(r);
+        break;
+    case LN_READ:
         result = read((int)r[0], (void *)(uintptr_t)r[1], (size_t)r[2]);
         if (result < 0) result = -errno;
         break;
-    case 64:
+    case LN_WRITE:
         result = write((int)r[0], (const void *)(uintptr_t)r[1], (size_t)r[2]);
         if (result < 0) result = -errno;
         break;
-    case 93:
-    case 94:
+    case LN_EXIT:
+    case LN_EXIT_GROUP:
         if (trace_calls)
             fprintf(stderr, "lnative: syscall %llu exit=%u\n",
                     (unsigned long long)r[8], (unsigned)(r[0] & 255));

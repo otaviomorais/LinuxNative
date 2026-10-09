@@ -21,9 +21,23 @@ directory for the clone. If the repository is private, use your own authorized
 GitHub access on the phone; do not paste credentials into chat. Keep the checkout
 in Termux's app-private home, not shared storage such as `/sdcard`.
 
+## Update an existing checkout
+
+For the checkout used in the previous test:
+
+```sh
+cd ~/LinuxNative
+git pull --ff-only origin main
+sh tools/test-termux.sh
+```
+
+Keep local edits if Git reports a conflict; do not reset the directory to force
+an update. The test script rebuilds the runtime and all guest fixtures.
+
 ## Report results
 
-The expected result is 23 passing tests. Copy the final summary or the actual
+The current expected result is 32 passing tests. The previous 23-test Android
+success is recorded in [validation.md](validation.md). Copy the final summary or the actual
 failure output into chat. Build and test errors are recorded separately:
 
 ```sh

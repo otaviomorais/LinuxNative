@@ -1,6 +1,7 @@
 """Functional tests of the actual AArch64 loader and syscall gateway."""
 import argparse
 import hashlib
+import json
 import os
 from pathlib import Path
 import shlex
@@ -12,6 +13,8 @@ import unittest
 PROJECT = Path(__file__).resolve().parent.parent
 RUNTIME = PROJECT / "build/lnative"
 PROBE = PROJECT / "build/probe"
+FILE_SCAN = PROJECT / "build/file-scan"
+FILE_ABI = PROJECT / "build/file-abi"
 RUNNER = []
 
 
@@ -31,12 +34,17 @@ class RuntimeTests(unittest.TestCase):
         self.content = b"LinuxNative: root translation works\n"
         (self.root / "etc/linuxnative-probe.txt").write_bytes(self.content)
 
-    def run_guest(self, image=PROBE, root=None, verbose=False):
+    def run_guest(self, image=PROBE, root=None, verbose=False, args=()):
         command = RUNNER + [str(RUNTIME)]
         if verbose:
             command.append("--verbose")
         command += ["--root", str(root or self.root), str(image)]
+        command += list(args)
         return subprocess.run(command, capture_output=True, timeout=15)
+
+    def run_direct(self, image, args=()):
+        return subprocess.run(RUNNER + [str(image)] + list(args),
+                              capture_output=True, timeout=15)
 
     def mutated(self, mutate):
         data = bytearray(PROBE.read_bytes())
@@ -165,6 +173,88 @@ class RuntimeTests(unittest.TestCase):
             site = d.index(struct.pack("<I", 0xD4000001))
             struct.pack_into("<I", d, site, 0xD4000021)
         self.assert_rejected(mutate, "unsupported SVC immediate")
+
+    def test_c_file_inspector_matches_direct_execution_and_host(self):
+        path = self.root / "etc/file with spaces-ação.bin"
+        for content in (b"", b"C program running without ptrace\n", bytes(range(256)) * 41):
+            with self.subTest(size=len(content)):
+                path.write_bytes(content)
+                os.chmod(path, 0o640)
+                expected = path.stat()
+                native = self.run_direct(FILE_SCAN, [str(path)])
+                translated = self.run_guest(FILE_SCAN, args=["/etc/" + path.name])
+                self.assertEqual(native.returncode, 0, native.stderr.decode())
+                self.assertEqual(translated.returncode, 0, translated.stderr.decode())
+                self.assertEqual(translated.stdout, native.stdout)
+                actual = json.loads(translated.stdout)
+                fingerprint = 14695981039346656037
+                for value in content:
+                    fingerprint = ((fingerprint ^ value) * 1099511628211) & ((1 << 64) - 1)
+                self.assertEqual(actual, {
+                    "size": expected.st_size, "mode": expected.st_mode,
+                    "uid": expected.st_uid, "gid": expected.st_gid,
+                    "nlink": expected.st_nlink, "ino": expected.st_ino,
+                    "dev": expected.st_dev, "blksize": expected.st_blksize,
+                    "blocks": expected.st_blocks,
+                    "mtime_sec": expected.st_mtime_ns // 1_000_000_000,
+                    "mtime_nsec": expected.st_mtime_ns % 1_000_000_000,
+                    "fnv1a64": f"{fingerprint:016x}",
+                })
+
+    def test_c_program_usage_arguments(self):
+        for args in ([], ["one", "two"], ["", ""]):
+            with self.subTest(args=args):
+                native = self.run_direct(FILE_SCAN, args)
+                translated = self.run_guest(FILE_SCAN, args=args)
+                self.assertEqual(native.returncode, 2)
+                self.assertEqual(translated.returncode, native.returncode)
+                self.assertEqual(translated.stderr, native.stderr)
+
+    def test_c_program_missing_file(self):
+        native = self.run_direct(FILE_SCAN, [str(self.root / "missing")])
+        translated = self.run_guest(FILE_SCAN, args=["/missing"])
+        self.assertEqual(native.returncode, 3)
+        self.assertEqual(translated.returncode, native.returncode)
+        self.assertEqual(translated.stderr, native.stderr)
+
+    def test_c_program_directory_rejected(self):
+        native = self.run_direct(FILE_SCAN, [str(self.root / "etc")])
+        translated = self.run_guest(FILE_SCAN, args=["/etc"])
+        self.assertEqual(native.returncode, 4)
+        self.assertEqual(translated.returncode, native.returncode)
+        self.assertEqual(translated.stderr, native.stderr)
+
+    def test_file_abi_errors_and_64bit_seek_match_direct_execution(self):
+        path = self.root / "etc/linuxnative-probe.txt"
+        native = self.run_direct(FILE_ABI, [str(path)])
+        translated = self.run_guest(FILE_ABI, args=["/etc/linuxnative-probe.txt"])
+        self.assertEqual(native.returncode, 0, native.stderr.decode())
+        self.assertEqual(translated.returncode, 0, translated.stderr.decode())
+        self.assertEqual(translated.stdout, native.stdout)
+        self.assertEqual(translated.stdout, b"file ABI ok\n")
+
+    def test_compiled_c_elf_is_unchanged(self):
+        before = hashlib.sha256(FILE_SCAN.read_bytes()).digest()
+        result = self.run_guest(FILE_SCAN, args=["/etc/linuxnative-probe.txt"])
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertEqual(hashlib.sha256(FILE_SCAN.read_bytes()).digest(), before)
+
+    def test_guest_argument_stack_budget(self):
+        result = self.run_guest(FILE_SCAN, args=["x" * 110000] * 5)
+        self.assertEqual(result.returncode, 1, result.stderr.decode())
+        self.assertIn(b"arguments exceed stack budget", result.stderr)
+
+    def test_file_bytes_in_zero_memory_segment_rejected(self):
+        self.assert_rejected(
+            lambda d: struct.pack_into("<Q", d, program_headers(d)[1] + 40, 0),
+            "segment")
+
+    def test_c_file_inspector_empty_path_argument(self):
+        native = self.run_direct(FILE_SCAN, [""])
+        translated = self.run_guest(FILE_SCAN, args=[""])
+        self.assertEqual(native.returncode, 3)
+        self.assertEqual(translated.returncode, 3)
+        self.assertEqual(translated.stderr, native.stderr)
 
 
 if __name__ == "__main__":
