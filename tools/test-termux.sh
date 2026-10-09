@@ -22,7 +22,7 @@ mkdir -p build
         printf 'Android: '; getprop ro.build.version.release
         printf 'SDK: '; getprop ro.build.version.sdk
     fi
-    printf 'Page size: '; getconf PAGESIZE
+    printf 'Page size: '; python -c 'import os; print(os.sysconf("SC_PAGE_SIZE"))'
     clang --version
 } > build/device-info.txt
 # Rebuild only generated targets, to avoid reusing a cloud/glibc executable.
