@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include "lnative.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdio.h>
@@ -8,6 +9,7 @@
 #include <string.h>
 #include <sys/auxv.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <ucontext.h>
 #include <unistd.h>
 
@@ -66,6 +68,137 @@ static void crash_handler(int sig, siginfo_t *info, void *uctx)
     _exit(128 + sig);
 }
 
+static int is_x86_64_elf(const char *path)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return 0;
+    unsigned char header[64];
+    ssize_t n = read(fd, header, sizeof(header));
+    close(fd);
+    if (n < 64) return 0;
+    if (header[0] != 0x7f || header[1] != 'E' || header[2] != 'L' || header[3] != 'F')
+        return 0;
+    if (header[4] != 2) /* ELFCLASS64 */
+        return 0;
+    if (header[5] != 1) /* ELFDATA2LSB */
+        return 0;
+    uint16_t machine = (uint16_t)header[18] | ((uint16_t)header[19] << 8);
+    return (machine == 0x3e); /* EM_X86_64 = 62 */
+}
+
+static int find_transpiler(char *out, size_t sz)
+{
+    const char *env = getenv("LNATIVE_TRANSPILE_PY");
+    if (env && access(env, R_OK) == 0) {
+        snprintf(out, sz, "%s", env);
+        return 0;
+    }
+
+    char exe[PATH_MAX];
+    ssize_t len = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+    if (len > 0) {
+        exe[len] = '\0';
+        char *last_slash = strrchr(exe, '/');
+        if (last_slash) {
+            *last_slash = '\0';
+            snprintf(out, sz, "%s/../tools/x86_transpile.py", exe);
+            if (access(out, R_OK) == 0) return 0;
+            snprintf(out, sz, "%s/tools/x86_transpile.py", exe);
+            if (access(out, R_OK) == 0) return 0;
+        }
+    }
+
+    const char *home = getenv("HOME");
+    if (home) {
+        snprintf(out, sz, "%s/LinuxNative/tools/x86_transpile.py", home);
+        if (access(out, R_OK) == 0) return 0;
+    }
+
+    return -1;
+}
+
+static int compute_file_fingerprint(const char *path, char *hex_out, size_t hex_sz)
+{
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) return -1;
+    struct stat st;
+    if (fstat(fd, &st) < 0) { close(fd); return -1; }
+
+    uint64_t h1 = 14695981039346656037ULL;
+    uint64_t h2 = 0xcbf29ce484222325ULL;
+    unsigned char buf[16384];
+    ssize_t n;
+    while ((n = read(fd, buf, sizeof(buf))) > 0) {
+        for (ssize_t i = 0; i < n; i++) {
+            h1 = (h1 ^ buf[i]) * 1099511628211ULL;
+            h2 = (h2 ^ buf[i]) * 0x100000001b3ULL;
+        }
+    }
+    close(fd);
+    snprintf(hex_out, hex_sz, "%016llx%016llx_%llx",
+             (unsigned long long)h1, (unsigned long long)h2, (unsigned long long)st.st_size);
+    return 0;
+}
+
+static int ensure_x86_transpiled(const char *src_path, char *out_path, size_t out_sz, int verbose)
+{
+    char transpiler[PATH_MAX];
+    if (find_transpiler(transpiler, sizeof(transpiler)) != 0) {
+        if (verbose)
+            fprintf(stderr, "lnative: x86_transpile.py tool not found\n");
+        return -1;
+    }
+
+    char fingerprint[64];
+    if (compute_file_fingerprint(src_path, fingerprint, sizeof(fingerprint)) != 0) {
+        return -1;
+    }
+
+    const char *home = getenv("HOME");
+    if (!home || !*home) home = "/tmp";
+    char cache_dir[PATH_MAX];
+    snprintf(cache_dir, sizeof(cache_dir), "%s/.cache/lnative/aot", home);
+
+    char mkdir_cmd[PATH_MAX + 32];
+    snprintf(mkdir_cmd, sizeof(mkdir_cmd), "mkdir -p \"%s\"", cache_dir);
+    (void)system(mkdir_cmd);
+
+    char cached_elf[PATH_MAX];
+    snprintf(cached_elf, sizeof(cached_elf), "%s/aot_%s.elf", cache_dir, fingerprint);
+
+    /* Check if cache already exists and is executable */
+    if (access(cached_elf, X_OK) == 0) {
+        if (verbose)
+            fprintf(stderr, "lnative: AOT cache hit: %s\n", cached_elf);
+        snprintf(out_path, out_sz, "%s", cached_elf);
+        return 0;
+    }
+
+    if (verbose)
+        fprintf(stderr, "lnative: transpiling x86_64 binary to native AArch64: %s -> %s\n",
+                src_path, cached_elf);
+
+    char cmd[PATH_MAX * 3 + 128];
+    if (verbose) {
+        snprintf(cmd, sizeof(cmd), "python3 \"%s\" \"%s\" -o \"%s\"",
+                 transpiler, src_path, cached_elf);
+    } else {
+        snprintf(cmd, sizeof(cmd), "python3 \"%s\" \"%s\" -o \"%s\" >/dev/null 2>&1",
+                 transpiler, src_path, cached_elf);
+    }
+
+    int ret = system(cmd);
+    if (ret != 0 || access(cached_elf, X_OK) != 0) {
+        if (verbose)
+            fprintf(stderr, "lnative: transpilation failed (exit %d)\n", ret);
+        unlink(cached_elf);
+        return -1;
+    }
+
+    snprintf(out_path, out_sz, "%s", cached_elf);
+    return 0;
+}
+
 int main(int argc, char **argv)
 {
     struct sigaction sa;
@@ -77,20 +210,50 @@ int main(int argc, char **argv)
     sigaction(SIGILL, &sa, NULL);
 
     int verbose = 0;
-    if (argc > 1 && !strcmp(argv[1], "--verbose")) {
-        verbose = 1;
-        ++argv;
-        --argc;
+    const char *root = NULL;
+    int arg_idx = 1;
+
+    while (arg_idx < argc) {
+        if (!strcmp(argv[arg_idx], "--verbose")) {
+            verbose = 1;
+            arg_idx++;
+        } else if (!strcmp(argv[arg_idx], "--root")) {
+            if (arg_idx + 1 >= argc) {
+                fprintf(stderr, "usage: lnative [--verbose] --root DIRECTORY STATIC_ELF [ARG...]\n"
+                                "Experimental: trusted AArch64 probes only; not a sandbox.\n");
+                return 2;
+            }
+            root = argv[arg_idx + 1];
+            arg_idx += 2;
+        } else {
+            break;
+        }
     }
-    if (argc < 4 || strcmp(argv[1], "--root")) {
+
+    if (arg_idx >= argc) {
         fprintf(stderr, "usage: lnative [--verbose] --root DIRECTORY STATIC_ELF [ARG...]\n"
                         "Experimental: trusted AArch64 probes only; not a sandbox.\n");
         return 2;
     }
-    if (ln_runtime_init(argv[2], verbose))
+
+    if (!root) {
+        root = ".";
+    }
+
+    if (ln_runtime_init(root, verbose))
         return 1;
     char target_path[PATH_MAX];
-    resolve_binary(argv[2], argv[3], target_path, sizeof(target_path));
+    resolve_binary(root, argv[arg_idx], target_path, sizeof(target_path));
+
+    if (is_x86_64_elf(target_path)) {
+        if (verbose)
+            fprintf(stderr, "lnative: detected x86_64 ELF '%s'\n", target_path);
+        char cached_path[PATH_MAX];
+        if (ensure_x86_transpiled(target_path, cached_path, sizeof(cached_path), verbose) == 0) {
+            snprintf(target_path, sizeof(target_path), "%s", cached_path);
+        }
+    }
+
     struct ln_image image = {0};
     if (ln_load(target_path, &image))
         return 1;
@@ -101,7 +264,7 @@ int main(int argc, char **argv)
 
     if (image.interp[0] != '\0') {
         char interp_path[PATH_MAX];
-        if (resolve_interp(argv[2], image.interp, interp_path, sizeof(interp_path))) {
+        if (resolve_interp(root, image.interp, interp_path, sizeof(interp_path))) {
             fprintf(stderr, "lnative: cannot find interpreter '%s'\n", image.interp);
             return 1;
         }
@@ -124,7 +287,7 @@ int main(int argc, char **argv)
     ln_runtime_set_bounds((uintptr_t)image.base, max_top - (uintptr_t)image.base);
     size_t page = (size_t)sysconf(_SC_PAGESIZE);
     size_t stack_size = 1024 * 1024;
-    size_t guest_argc = (size_t)argc - 3;
+    size_t guest_argc = (size_t)(argc - arg_idx);
 
     /* Setup standard guest environment variables */
     char env_user[128], env_home[PATH_MAX], env_term[128];
@@ -149,7 +312,7 @@ int main(int argc, char **argv)
     /* Reserve at least half of the stack for execution, including the gateway. */
     size_t argument_size = (guest_argc + guest_envc + 40) * sizeof(uint64_t) + 31;
     for (size_t i = 0; i < guest_argc; ++i) {
-        size_t length = strlen(argv[3 + i]) + 1;
+        size_t length = strlen(argv[arg_idx + i]) + 1;
         if (argument_size > stack_size / 2 || length > stack_size / 2 - argument_size) {
             fprintf(stderr, "lnative: guest arguments exceed stack budget\n");
             return 1;
@@ -216,9 +379,9 @@ int main(int argc, char **argv)
 
     initial[0] = guest_argc;
     for (size_t i = 0; i < guest_argc; ++i) {
-        size_t length = strlen(argv[3 + i]) + 1;
+        size_t length = strlen(argv[arg_idx + i]) + 1;
         top -= length;
-        memcpy((void *)top, argv[3 + i], length);
+        memcpy((void *)top, argv[arg_idx + i], length);
         initial[i + 1] = top;
     }
     initial[1 + guest_argc] = 0;

@@ -730,10 +730,19 @@ def transpile(input_elf, output_asm):
             asm_out.append(f"    b.pl loc_{t_val:x}")
         elif mnem == 'call':
             t = parts[0].split()[0].strip()
-            t_val = int(t, 16) if t.startswith('0x') else int(t)
-            asm_out.append("    str x30, [sp, #-16]!")
-            asm_out.append(f"    bl loc_{t_val:x}")
-            asm_out.append("    ldr x30, [sp], #16")
+            if t in REG_MAP and REG_MAP[t].startswith('x'):
+                r = REG_MAP[t]
+                asm_out.append("    str x30, [sp, #-16]!")
+                asm_out.append(f"    blr {r}")
+                asm_out.append("    ldr x30, [sp], #16")
+            else:
+                try:
+                    t_val = int(t, 16) if (t.startswith('0x') or all(c in '0123456789abcdefABCDEF' for c in t)) else int(t)
+                    asm_out.append("    str x30, [sp, #-16]!")
+                    asm_out.append(f"    bl loc_{t_val:x}")
+                    asm_out.append("    ldr x30, [sp], #16")
+                except ValueError:
+                    raise ValueError(f"unsupported call target: {t}")
         elif mnem.startswith('cmov'):
             cond_map = {
                 'cmove': 'eq', 'cmovz': 'eq',
@@ -1086,13 +1095,31 @@ def main():
 
     asm_file = args.output + ".s"
     print(f"[*] Lifting and transpiling {args.input_elf} (x86_64) -> {asm_file} (AArch64)...")
-    transpile(args.input_elf, asm_file)
+    try:
+        transpile(args.input_elf, asm_file)
+    except Exception as e:
+        sys.stderr.write(f"[-] Transpilation error: {e}\n")
+        if not args.keep_asm and os.path.exists(asm_file):
+            try:
+                os.remove(asm_file)
+            except OSError:
+                pass
+        sys.exit(1)
 
     print(f"[*] Assembling native AArch64 binary: {args.output}...")
     cmd = ['clang', '-O2', '-nostdlib', '-static', asm_file, '-o', args.output]
-    subprocess.run(cmd, check=True)
+    try:
+        subprocess.run(cmd, check=True)
+    except Exception as e:
+        sys.stderr.write(f"[-] Clang error: {e}\n")
+        if not args.keep_asm and os.path.exists(asm_file):
+            try:
+                os.remove(asm_file)
+            except OSError:
+                pass
+        sys.exit(1)
 
-    if not args.keep_asm:
+    if not args.keep_asm and os.path.exists(asm_file):
         os.remove(asm_file)
 
     print(f"[✓] Success! Native AArch64 ELF created: {args.output}")

@@ -532,6 +532,75 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(res_exec.returncode, 99)
         self.assertEqual(res_exec.stdout, b"FP_SSE_PASSED\n")
 
+    def test_lnative_transparent_x86_execution(self):
+        c_src = self.directory / "transp_prog.c"
+        x86_elf = self.directory / "transp_x86.elf"
+
+        c_src.write_text(
+            "void _start(void) {\n"
+            "    const char msg[] = \"TRANSPARENT_X86_PASSED\\n\";\n"
+            "    register long rax __asm__(\"rax\") = 1;\n"
+            "    register long rdi __asm__(\"rdi\") = 1;\n"
+            "    register const char *rsi __asm__(\"rsi\") = msg;\n"
+            "    register unsigned long rdx __asm__(\"rdx\") = 23;\n"
+            "    __asm__ volatile(\"syscall\" : \"+r\"(rax) : \"r\"(rdi), \"r\"(rsi), \"r\"(rdx) : \"rcx\", \"r11\", \"memory\");\n"
+            "    register long rax2 __asm__(\"rax\") = 60;\n"
+            "    register long rdi2 __asm__(\"rdi\") = 77;\n"
+            "    __asm__ volatile(\"syscall\" : \"+r\"(rax2) : \"r\"(rdi2) : \"memory\");\n"
+            "}\n"
+        )
+
+        res_cc = subprocess.run([
+            "clang", "--target=x86_64-linux-gnu", "-O2", "-ffreestanding",
+            "-fno-builtin", "-nostdlib", "-static",
+            str(c_src), "-o", str(x86_elf)
+        ], capture_output=True)
+        if res_cc.returncode != 0:
+            self.skipTest("clang x86_64 target compilation unavailable")
+
+        # Test transparent execution with --root
+        res = subprocess.run([str(RUNTIME), "--root", str(self.root), str(x86_elf)], capture_output=True)
+        self.assertEqual(res.returncode, 77, res.stderr.decode(errors="replace"))
+        self.assertEqual(res.stdout, b"TRANSPARENT_X86_PASSED\n")
+
+        # Test transparent execution without --root flag
+        res_noroot = subprocess.run([str(RUNTIME), str(x86_elf)], capture_output=True)
+        self.assertEqual(res_noroot.returncode, 77, res_noroot.stderr.decode(errors="replace"))
+        self.assertEqual(res_noroot.stdout, b"TRANSPARENT_X86_PASSED\n")
+
+    def test_lnative_transparent_x86_cache_hit(self):
+        c_src = self.directory / "cache_prog.c"
+        x86_elf = self.directory / "cache_x86.elf"
+        import time
+        nonce = int(time.time() * 1000)
+
+        c_src.write_text(
+            f"__attribute__((used)) static const volatile long g_nonce = {nonce}L;\n"
+            "void _start(void) {\n"
+            "    register long rax __asm__(\"rax\") = 60;\n"
+            "    register long rdi __asm__(\"rdi\") = 33;\n"
+            "    __asm__ volatile(\"syscall\" : \"+r\"(rax) : \"r\"(rdi) : \"memory\");\n"
+            "}\n"
+        )
+
+        res_cc = subprocess.run([
+            "clang", "--target=x86_64-linux-gnu", "-O2", "-ffreestanding",
+            "-fno-builtin", "-nostdlib", "-static",
+            str(c_src), "-o", str(x86_elf)
+        ], capture_output=True)
+        if res_cc.returncode != 0:
+            self.skipTest("clang x86_64 target compilation unavailable")
+
+        # First run populates the cache
+        res1 = subprocess.run([str(RUNTIME), "--verbose", "--root", str(self.root), str(x86_elf)], capture_output=True)
+        self.assertEqual(res1.returncode, 33, res1.stderr.decode(errors="replace"))
+        self.assertIn(b"transpiling x86_64 binary", res1.stderr)
+
+        # Second run hits the AOT cache
+        res2 = subprocess.run([str(RUNTIME), "--verbose", "--root", str(self.root), str(x86_elf)], capture_output=True)
+        self.assertEqual(res2.returncode, 33, res2.stderr.decode(errors="replace"))
+        self.assertIn(b"AOT cache hit:", res2.stderr)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
