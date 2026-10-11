@@ -6,6 +6,7 @@
 #include <limits.h>
 #include <signal.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <sys/mman.h>
@@ -23,6 +24,8 @@
 #endif
 
 static int root_fd = -1;
+static char root_prefix[PATH_MAX];
+static size_t root_prefix_len;
 static int trace_calls;
 static uintptr_t guest_brk_initial;
 static uintptr_t guest_brk_current;
@@ -45,6 +48,16 @@ int ln_runtime_init(const char *root, int verbose)
         return -1;
     }
     trace_calls = verbose;
+    if (realpath(root, root_prefix)) {
+        root_prefix_len = strlen(root_prefix);
+        while (root_prefix_len > 1 && root_prefix[root_prefix_len - 1] == '/') {
+            root_prefix[--root_prefix_len] = '\0';
+        }
+    } else {
+        strncpy(root_prefix, root, sizeof(root_prefix) - 1);
+        root_prefix[sizeof(root_prefix) - 1] = '\0';
+        root_prefix_len = strlen(root_prefix);
+    }
     return 0;
 }
 
@@ -57,6 +70,16 @@ static long guest_resolve_path(const char *path, const char **rel_path)
         return -ENAMETOOLONG;
     if (path[0] != '/')
         return -EOPNOTSUPP;
+
+    /* If the path begins with root_prefix, strip it */
+    if (root_prefix_len > 0 && !strncmp(path, root_prefix, root_prefix_len)) {
+        if (path[root_prefix_len] == '/' || path[root_prefix_len] == '\0') {
+            path += root_prefix_len;
+            if (!*path)
+                path = "/";
+        }
+    }
+
     for (const char *p = path; *p;) {
         while (*p == '/') ++p;
         const char *end = p;
@@ -72,8 +95,9 @@ static long guest_resolve_path(const char *path, const char **rel_path)
 
 static long guest_open(const uint64_t *r)
 {
+    const char *path = (const char *)(uintptr_t)r[1];
     const char *rel_path = NULL;
-    long err = guest_resolve_path((const char *)(uintptr_t)r[1], &rel_path);
+    long err = guest_resolve_path(path, &rel_path);
     if (err) return err;
 
 #ifndef O_LARGEFILE
@@ -86,6 +110,9 @@ static long guest_open(const uint64_t *r)
         return -EOPNOTSUPP;
 
     int fd = openat(root_fd, rel_path, (int)r[2], (mode_t)r[3]);
+    if (fd < 0 && errno == ENOENT && (!strncmp(path, "/dev/", 5) || !strncmp(path, "/proc/", 6))) {
+        fd = open(path, (int)r[2], (mode_t)r[3]);
+    }
     return fd < 0 ? -errno : fd;
 }
 
@@ -161,6 +188,9 @@ static long guest_newfstatat(const uint64_t *r)
         long err = guest_resolve_path(path, &rel_path);
         if (err) return err;
         ret = fstatat(root_fd, rel_path, &host, flags & ~0x1000);
+        if (ret < 0 && errno == ENOENT && (!strncmp(path, "/dev/", 5) || !strncmp(path, "/proc/", 6))) {
+            ret = fstatat(AT_FDCWD, path, &host, flags & ~0x1000);
+        }
     }
     if (ret < 0) return -errno;
     return marshal_stat(&host, statbuf);
@@ -175,8 +205,14 @@ static long guest_faccessat(const uint64_t *r)
     long err = guest_resolve_path(path, &rel_path);
     if (err) return err;
 
-    if (faccessat(root_fd, rel_path, mode, 0))
+    if (faccessat(root_fd, rel_path, mode, 0)) {
+        if (errno == ENOENT && (!strncmp(path, "/dev/", 5) || !strncmp(path, "/proc/", 6))) {
+            if (faccessat(AT_FDCWD, path, mode, 0))
+                return -errno;
+            return 0;
+        }
         return -errno;
+    }
     return 0;
 }
 

@@ -37,6 +37,13 @@ For `ET_DYN`, the loader assigns an available base address (`load_bias`), shifts
 and stub targets by `load_bias`, and sets the entry point accordingly. Dynamic segments (`PT_DYNAMIC`)
 are permitted for `ET_DYN` images (enabling dynamic linkers like `ld-linux-aarch64.so.1`) while
 rejected on `ET_EXEC`. BSS regions (`p_memsz > p_filesz`) are explicitly zero-filled.
+
+When a binary requests a program interpreter via `PT_INTERP` (ordinary dynamically linked ELF):
+1. The main binary is loaded and its segment metadata (`AT_PHDR`, `AT_ENTRY`) is recorded.
+2. The interpreter specified in `PT_INTERP` is resolved relative to `--root` (e.g. `/lib/ld-linux-aarch64.so.1`).
+3. The interpreter (`ld.so`) is mapped at an independent base address via `mmap`, and its SVC sites are rewritten.
+4. The guest stack is populated with `AT_BASE` set to the interpreter's base address, and control is transferred to the interpreter's entry point. The dynamic linker bootstraps, relocates the main binary, and jumps to `AT_ENTRY`.
+
 For `ET_EXEC`, it refuses collisions and kernels that ignore `MAP_FIXED_NOREPLACE`; it never falls back
 to destructive `MAP_FIXED`. The reservation starts PROT_NONE, segments become RW for
 copying/patching, and code becomes RX after cache maintenance. The stub area follows the

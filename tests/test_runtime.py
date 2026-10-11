@@ -371,6 +371,26 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(res_echo.returncode, 0, res_echo.stderr.decode())
         self.assertEqual(res_echo.stdout, b"DebianOK\n")
 
+    def test_direct_debian_binary_execution_via_interp(self):
+        glibc_root = Path("/data/data/com.termux/files/usr/glibc")
+        if not (glibc_root / "bin/true").exists() or not (glibc_root / "bin/bash").exists():
+            self.skipTest("glibc environment not available")
+        # 1. Direct /bin/true without specifying ld.so
+        res_true = self.run_guest(glibc_root / "bin/true", root=glibc_root, verbose=True)
+        self.assertEqual(res_true.returncode, 0, res_true.stderr.decode())
+        # 2. Direct /bin/uname -s
+        res_uname = self.run_guest(glibc_root / "bin/uname", root=glibc_root, args=["-s"])
+        self.assertEqual(res_uname.returncode, 0, res_uname.stderr.decode())
+        self.assertEqual(res_uname.stdout, b"Linux\n")
+        # 3. Direct /bin/echo
+        res_echo = self.run_guest(glibc_root / "bin/echo", root=glibc_root, args=["DebianDirectOK"])
+        self.assertEqual(res_echo.returncode, 0, res_echo.stderr.decode())
+        self.assertEqual(res_echo.stdout, b"DebianDirectOK\n")
+        # 4. Direct /bin/bash executing arithmetic and echo
+        res_bash = self.run_guest(glibc_root / "bin/bash", root=glibc_root, args=["-c", "echo $((20+22))"])
+        self.assertEqual(res_bash.returncode, 0, res_bash.stderr.decode())
+        self.assertEqual(res_bash.stdout, b"42\n")
+
 
 
 if __name__ == "__main__":

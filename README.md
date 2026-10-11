@@ -17,14 +17,15 @@ QEMU is used only to test ARM64 code on x86_64 development machines.
 - Cross-compiled with GCC 14 and executed with QEMU user mode 10 on Linux x86_64.
 - Milestone 0's 23 tests passed on the user's Poco F3 according to their report:
   Android 17 / SDK 37, kernel 4.19, 4 KiB pages, Clang 21.1.8 in Termux.
-- The current suite has 42 tests, adding direct-vs-runtime execution of C
+- The current suite has 43 tests, adding direct-vs-runtime execution of C
   programs, static PIE (`ET_DYN`) relocatable binaries, stripped binaries via linear
   SVC scanning, full Linux auxiliary vector (`auxv`), thread register isolation
-  (`tpidr_el0`), file metadata, seeking, directory traversal (`getdents64`), process credentials,
+  (`tpidr_el0`), automatic `PT_INTERP` dynamic linker loading for direct binary execution,
+  file metadata, seeking, directory traversal (`getdents64`), process credentials,
   filesystem mutation, micro-libc dynamic memory allocation (`mmap`, `munmap`, `mprotect`, `brk`),
-  system identification (`uname`), and Debian/glibc dynamic linker and utility execution
-  (`ld-linux-aarch64.so.1`, `/bin/true`, `/bin/uname`, `/bin/echo`, `/bin/ls`).
-  All 42 tests pass natively on Android ARM64 (Poco F3, Android 17 / SDK 37, Clang 21.1.8 in Termux).
+  system identification (`uname`), and Debian/glibc direct utility execution
+  (`/bin/true`, `/bin/uname`, `/bin/echo`, `/bin/bash`).
+  All 43 tests pass natively on Android ARM64 (Poco F3, Android 17 / SDK 37, Clang 21.1.8 in Termux).
 - See [validation evidence and limits](docs/validation.md). Other devices and
   16 KiB pages remain unverified. Remote CI results have not been verified here.
 
@@ -134,7 +135,9 @@ build/lnative --root "$PWD" build/mini-ls /build
   `set_tid_address`, `set_robust_list`, `nanosleep`, `clock_gettime`, `rt_sigaction`,
   `rt_sigprocmask`, `brk`, `mmap`, `munmap`, `mprotect`, `madvise`, `prlimit64`,
   `getrandom`, `exit`, `exit_group`. Others return raw `-ENOSYS`.
-- CLI: `lnative [--verbose] --root DIRECTORY STATIC_ELF [ARG...]`.
+- CLI: `lnative [--verbose] --root DIRECTORY ELF_BINARY [ARG...]`.
+  Dynamically linked binaries with `PT_INTERP` automatically locate and load the dynamic
+  linker from the guest rootfs, initializing `auxv` (`AT_BASE`, `AT_ENTRY`, `AT_PHDR`).
   Arguments are copied to a 16-byte-aligned guest stack with a bounded budget.
 - Unsupported open modes and relative paths return `-EOPNOTSUPP`; `..` components
   return `-EACCES`. No claim of a complete Linux filesystem or process ABI.

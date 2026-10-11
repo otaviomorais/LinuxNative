@@ -1,6 +1,7 @@
 #ifndef LNATIVE_H
 #define LNATIVE_H
 
+#include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -12,6 +13,7 @@ struct ln_image {
     uintptr_t phdr;
     size_t phent;
     size_t phnum;
+    char interp[PATH_MAX];
 };
 
 int ln_load(const char *path, struct ln_image *image);
