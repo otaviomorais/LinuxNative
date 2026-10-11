@@ -32,13 +32,15 @@ regions are checked before mapping executable code. File size is bounded to
 64 MiB, image span to 32 MiB, and patched sites to 65,536. Dynamic/TLS segments,
 overlapping pages and writable executable segments are rejected.
 
-The loader reserves the original guest address range plus gateway space with
-`MAP_FIXED_NOREPLACE`. It refuses collisions and kernels that ignore this flag;
-it never falls back to destructive `MAP_FIXED`. The reservation starts PROT_NONE,
-segments become RW for copying/patching, and code becomes RX after cache
-maintenance. The stub area follows the same RW-to-RX sequence. There is no RWX
-mapping. Segment alignment is checked against the runtime's actual page size;
-the test linker script separates segments at 64 KiB boundaries.
+The loader supports fixed-address `ET_EXEC` binaries via `MAP_FIXED_NOREPLACE`
+as well as relocatable static PIE (`ET_DYN`) binaries via anonymous `mmap(NULL, ...)`.
+For `ET_DYN`, the loader assigns an available base address (`load_bias`), shifts all segment
+and stub targets by `load_bias`, and sets the entry point accordingly. For `ET_EXEC`,
+it refuses collisions and kernels that ignore `MAP_FIXED_NOREPLACE`; it never falls back
+to destructive `MAP_FIXED`. The reservation starts PROT_NONE, segments become RW for
+copying/patching, and code becomes RX after cache maintenance. The stub area follows the
+same RW-to-RX sequence. There is no RWX mapping. Segment alignment is checked against the
+runtime's actual page size; the test linker script separates segments at 64 KiB boundaries.
 
 ## Gateway ABI
 

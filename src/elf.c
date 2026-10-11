@@ -183,8 +183,8 @@ int ln_load(const char *path, struct ln_image *image)
     const Elf64_Ehdr *eh = (const void *)file;
     if (memcmp(eh->e_ident, ELFMAG, SELFMAG) || eh->e_ident[EI_CLASS] != ELFCLASS64 ||
         eh->e_ident[EI_DATA] != ELFDATA2LSB || eh->e_ident[EI_VERSION] != EV_CURRENT ||
-        eh->e_machine != EM_AARCH64 || eh->e_type != ET_EXEC || eh->e_version != EV_CURRENT ||
-        eh->e_ehsize != sizeof(*eh)) {
+        eh->e_machine != EM_AARCH64 || (eh->e_type != ET_EXEC && eh->e_type != ET_DYN) ||
+        eh->e_version != EV_CURRENT || eh->e_ehsize != sizeof(*eh)) {
         reject("requires little-endian AArch64 ET_EXEC"); goto done;
     }
     if (!eh->e_phnum || eh->e_phnum > 128 || eh->e_phentsize != sizeof(Elf64_Phdr) ||
@@ -201,7 +201,10 @@ int ln_load(const char *path, struct ln_image *image)
             reject("dynamic linking, TLS, and executable stacks unsupported"); goto done;
         }
         if (ph[i].p_type != PT_LOAD) continue;
-        if (!ph[i].p_memsz || ph[i].p_memsz > MAX_SPAN || ph[i].p_vaddr < 65536 ||
+        if (eh->e_type == ET_EXEC && ph[i].p_vaddr < 65536) {
+            reject("invalid, unreadable, or writable-executable segment"); goto done;
+        }
+        if (!ph[i].p_memsz || ph[i].p_memsz > MAX_SPAN ||
             !inside(ph[i].p_vaddr, ph[i].p_memsz, 1ULL << 47) ||
             !inside(ph[i].p_offset, ph[i].p_filesz, length) || ph[i].p_filesz > ph[i].p_memsz ||
             !(ph[i].p_flags & PF_R) || ((ph[i].p_flags & (PF_W | PF_X)) == (PF_W | PF_X))) {
@@ -218,29 +221,46 @@ int ln_load(const char *path, struct ln_image *image)
         if (begin < low) low = begin;
         if (end > high) high = end;
     }
+    if (eh->e_type == ET_DYN) {
+        if (low != 0) {
+            reject("ET_DYN requires relocatable base 0; got fixed AArch64 ET_EXEC address");
+            goto done;
+        }
+    }
     if (low == UINTPTR_MAX || high - low > MAX_SPAN) { reject("invalid image span"); goto done; }
     size_t count = 0;
     if (collect_sites(file, length, eh, ph, sites, &count)) goto done;
     size_t stub_bytes = up(count * STUB_SIZE, page);
     reservation = high - low + stub_bytes;
-    mapping = mmap((void *)low, reservation, PROT_NONE,
-                   MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
-    if (mapping == MAP_FAILED) { perror("lnative: reserve guest address space"); goto done; }
-    if ((uintptr_t)mapping != low) { reject("MAP_FIXED_NOREPLACE unavailable"); goto done; }
+    uintptr_t load_bias = 0;
+    if (eh->e_type == ET_DYN) {
+        mapping = mmap(NULL, reservation, PROT_NONE,
+                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (mapping == MAP_FAILED) { perror("lnative: reserve guest address space"); goto done; }
+        load_bias = (uintptr_t)mapping;
+    } else {
+        mapping = mmap((void *)low, reservation, PROT_NONE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        if (mapping == MAP_FAILED) { perror("lnative: reserve guest address space"); goto done; }
+        if ((uintptr_t)mapping != low) { reject("MAP_FIXED_NOREPLACE unavailable"); goto done; }
+        load_bias = 0;
+    }
     for (size_t i = 0; i < eh->e_phnum; ++i) {
         if (ph[i].p_type != PT_LOAD) continue;
-        uintptr_t begin = down(ph[i].p_vaddr, page);
-        size_t size = up(ph[i].p_vaddr + ph[i].p_memsz, page) - begin;
+        uintptr_t seg_vaddr = ph[i].p_vaddr + load_bias;
+        uintptr_t begin = down(seg_vaddr, page);
+        size_t size = up(seg_vaddr + ph[i].p_memsz, page) - begin;
         if (mprotect((void *)begin, size, PROT_READ | PROT_WRITE)) {
             perror("lnative: populate segment"); goto done;
         }
-        memcpy((void *)ph[i].p_vaddr, file + ph[i].p_offset, ph[i].p_filesz);
+        memcpy((void *)seg_vaddr, file + ph[i].p_offset, ph[i].p_filesz);
     }
-    if (mprotect((void *)high, stub_bytes, PROT_READ | PROT_WRITE)) {
+    uintptr_t stub_base = high + load_bias;
+    if (mprotect((void *)stub_base, stub_bytes, PROT_READ | PROT_WRITE)) {
         perror("lnative: populate gateways"); goto done;
     }
     for (size_t i = 0; i < count; ++i) {
-        uintptr_t stub = high + i * STUB_SIZE;
+        uintptr_t stub = stub_base + i * STUB_SIZE;
         uint32_t words[12] = {
             0xa9be47f0, /* stp x16,x17,[sp,#-32]! */
             0xf9000bfe, /* str x30,[sp,#16] */
@@ -250,19 +270,21 @@ int ln_load(const char *path, struct ln_image *image)
             0xa8c247f0, /* ldp x16,x17,[sp],#32 */
             0, 0xd503201f, 0, 0, 0xd503201f, 0xd503201f
         };
+        uintptr_t site = sites[i] + load_bias;
         uint32_t jump;
-        if (branch(sites[i], stub, &jump) || branch(stub + 24, sites[i] + 4, &words[6])) {
+        if (branch(site, stub, &jump) || branch(stub + 24, site + 4, &words[6])) {
             reject("gateway outside direct-branch range"); goto done;
         }
         uint64_t target = (uintptr_t)ln_gateway;
         memcpy(&words[8], &target, sizeof(target));
         memcpy((void *)stub, words, sizeof(words));
-        memcpy((void *)sites[i], &jump, sizeof(jump));
+        memcpy((void *)site, &jump, sizeof(jump));
     }
     for (size_t i = 0; i < eh->e_phnum; ++i) {
         if (ph[i].p_type != PT_LOAD) continue;
-        uintptr_t begin = down(ph[i].p_vaddr, page);
-        size_t size = up(ph[i].p_vaddr + ph[i].p_memsz, page) - begin;
+        uintptr_t seg_vaddr = ph[i].p_vaddr + load_bias;
+        uintptr_t begin = down(seg_vaddr, page);
+        size_t size = up(seg_vaddr + ph[i].p_memsz, page) - begin;
         int protection = PROT_READ | ((ph[i].p_flags & PF_W) ? PROT_WRITE : 0) |
                          ((ph[i].p_flags & PF_X) ? PROT_EXEC : 0);
         if (ph[i].p_flags & PF_X)
@@ -271,11 +293,11 @@ int ln_load(const char *path, struct ln_image *image)
             perror("lnative: finalize segment permissions"); goto done;
         }
     }
-    __builtin___clear_cache((char *)high, (char *)(high + stub_bytes));
-    if (mprotect((void *)high, stub_bytes, PROT_READ | PROT_EXEC)) {
+    __builtin___clear_cache((char *)stub_base, (char *)(stub_base + stub_bytes));
+    if (mprotect((void *)stub_base, stub_bytes, PROT_READ | PROT_EXEC)) {
         perror("lnative: finalize gateways"); goto done;
     }
-    *image = (struct ln_image){mapping, reservation, eh->e_entry, count};
+    *image = (struct ln_image){mapping, reservation, eh->e_entry + load_bias, count};
     result = 0;
 done:
     if (result && mapping != MAP_FAILED) munmap(mapping, reservation);

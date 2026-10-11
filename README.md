@@ -17,12 +17,13 @@ QEMU is used only to test ARM64 code on x86_64 development machines.
 - Cross-compiled with GCC 14 and executed with QEMU user mode 10 on Linux x86_64.
 - Milestone 0's 23 tests passed on the user's Poco F3 according to their report:
   Android 17 / SDK 37, kernel 4.19, 4 KiB pages, Clang 21.1.8 in Termux.
-- The current suite has 38 tests, adding direct-vs-runtime execution of C
-  programs, file metadata, seeking, directory traversal (`getdents64`), process credentials
-  (`getpid`, `getuid`, etc.), filesystem mutation (`mkdirat`, `unlinkat`, `openat` with
+- The current suite has 39 tests, adding direct-vs-runtime execution of C
+  programs, static PIE (`ET_DYN`) relocatable binaries, file metadata, seeking,
+  directory traversal (`getdents64`), process credentials (`getpid`, `getuid`, etc.),
+  filesystem mutation (`mkdirat`, `unlinkat`, `openat` with
   `O_CREAT`/`O_WRONLY`/`O_RDWR`/`O_TRUNC`/`O_APPEND`/`O_EXCL`), micro-libc dynamic memory
   allocation (`mmap`, `munmap`, `mprotect`, `brk`), and system identification (`uname`).
-  All 38 tests pass natively on Android ARM64 (Poco F3, Android 17 / SDK 37, Clang 21.1.8 in Termux).
+  All 39 tests pass natively on Android ARM64 (Poco F3, Android 17 / SDK 37, Clang 21.1.8 in Termux).
 - See [validation evidence and limits](docs/validation.md). Other devices and
   16 KiB pages remain unverified. Remote CI results have not been verified here.
 
@@ -115,7 +116,7 @@ build/lnative --root "$PWD" build/mini-ls /build
 
 ## Current prototype contract
 
-- Trusted, little-endian AArch64 `ET_EXEC`; static, non-PIE, without TLS.
+- Trusted, little-endian AArch64 `ET_EXEC` or static PIE (`ET_DYN`); without TLS or dynamic linkers (`PT_INTERP`).
 - Complete AArch64 `$x`/`$d` mapping symbols, retained section/symbol tables,
   and one code section per executable load segment. Stripped binaries are refused.
 - Non-overlapping load-segment pages, no writable executable segments, and an

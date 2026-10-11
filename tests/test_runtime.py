@@ -18,6 +18,7 @@ FILE_ABI = PROJECT / "build/file-abi"
 MEM_ABI = PROJECT / "build/mem-abi"
 MINI_LS = PROJECT / "build/mini-ls"
 FS_MUT = PROJECT / "build/fs-mut"
+PIE_ABI = PROJECT / "build/pie-abi"
 RUNNER = []
 
 
@@ -317,6 +318,19 @@ class RuntimeTests(unittest.TestCase):
         result = self.run_guest(FS_MUT, args=["--security-check"])
         self.assertEqual(result.returncode, 0, result.stderr.decode())
         self.assertEqual(result.stdout, b"fs security policy ok\n")
+
+    def test_static_pie_matches_direct_execution(self):
+        native = self.run_direct(PIE_ABI)
+        translated = self.run_guest(PIE_ABI, verbose=True)
+        self.assertEqual(native.returncode, 0, native.stderr.decode())
+        self.assertEqual(translated.returncode, 0, translated.stderr.decode())
+        self.assertEqual(native.stdout, b"static PIE ABI ok\n")
+        self.assertEqual(translated.stdout, b"static PIE ABI ok\n")
+        self.assertIn(b"syscall 172", translated.stderr)
+        self.assertIn(b"syscall 174", translated.stderr)
+        self.assertIn(b"syscall 222", translated.stderr)
+        self.assertIn(b"syscall 215", translated.stderr)
+
 
 
 if __name__ == "__main__":

@@ -15,9 +15,15 @@ PROBE_FLAGS := -nostdlib -static -no-pie -Wl,--build-id=none -Wl,-T,tests/probe.
 ifneq ($(findstring clang,$(CC)),)
 PROBE_FLAGS += -Wno-unused-command-line-argument
 endif
+PIE_FLAGS := -O2 -std=c11 -Wall -Wextra -Werror -ffreestanding -fno-builtin \
+	-fno-stack-protector -fPIE -fno-unwind-tables -fno-asynchronous-unwind-tables \
+	-nostdlib -static -Wl,-pie -Wl,--build-id=none -Wl,-T,tests/pie.ld
+ifneq ($(findstring clang,$(CC)),)
+PIE_FLAGS += -Wno-unused-command-line-argument
+endif
 
 .PHONY: all test clean
-all: $(BUILD)/lnative $(BUILD)/probe $(BUILD)/file-scan $(BUILD)/file-abi $(BUILD)/mem-abi $(BUILD)/mini-ls $(BUILD)/fs-mut
+all: $(BUILD)/lnative $(BUILD)/probe $(BUILD)/file-scan $(BUILD)/file-abi $(BUILD)/mem-abi $(BUILD)/mini-ls $(BUILD)/fs-mut $(BUILD)/pie-abi
 
 $(BUILD):
 	mkdir -p $@
@@ -42,6 +48,9 @@ $(BUILD)/mini-ls: examples/mini-ls.c examples/start.S examples/micro-libc.h exam
 
 $(BUILD)/fs-mut: tests/fs-mut.c examples/start.S examples/micro-libc.h examples/guest.h include/linux_aarch64.h tests/probe.ld | $(BUILD)
 	$(CC) $(GUEST_FLAGS) examples/start.S tests/fs-mut.c -o $@
+
+$(BUILD)/pie-abi: tests/pie-abi.c examples/start.S examples/micro-libc.h examples/guest.h include/linux_aarch64.h tests/pie.ld | $(BUILD)
+	$(CC) $(PIE_FLAGS) examples/start.S tests/pie-abi.c -o $@
 
 test: all
 	$(PYTHON) tests/test_runtime.py --runner '$(RUNNER)'

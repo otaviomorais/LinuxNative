@@ -42,7 +42,7 @@ QEMU; on ARM64 they run directly. No performance conclusion follows from this.
 This is still a custom-linked freestanding executable, not an ordinary
 libc-linked or stripped Debian binary. It retains the milestone-0 ELF contract.
 
-## Milestone 1, 2, 3 & 4: Android native validation (38 tests passed)
+## Milestone 1, 2, 3, 4 & 5: Android native validation (39 tests passed)
 
 On the target Poco F3 (Android 17 / SDK 37, Linux kernel 4.19, Clang 21.1.8 in Termux),
 the expanded test suite has been built and executed natively via `tools/test-termux.sh`.
@@ -53,7 +53,8 @@ the expanded test suite has been built and executed natively via `tools/test-ter
 | Milestone 1 | Freestanding C file inspector, 64-bit seek, metadata marshalling | 32 / 32 passed | ~0.68s |
 | Milestone 2 | Virtual memory ABI (`mmap`, `munmap`, `mprotect`, `brk`), `uname`, W^X | 34 / 34 passed | ~0.40s |
 | Milestone 3 | Credentials (`get*id`), Directory I/O (`getdents64`), Micro-libc & `mini-ls` | 36 / 36 passed | ~0.39s |
-| Milestone 4 | Writable FS (`mkdirat`, `unlinkat`, `openat` write/create flags, `fs-mut`) | **38 / 38 passed** | **~0.42s** |
+| Milestone 4 | Writable FS (`mkdirat`, `unlinkat`, `openat` write/create flags, `fs-mut`) | 38 / 38 passed | ~0.42s |
+| Milestone 5 | Static PIE (`ET_DYN`) relocatable loading, `load_bias`, `pie-abi` | **39 / 39 passed** | **~0.44s** |
 
 All tests pass without root, ptrace, or signal traps. Build outputs, device metadata,
 and execution logs are recorded in `build/device-info.txt`, `build/device-build.log`,
