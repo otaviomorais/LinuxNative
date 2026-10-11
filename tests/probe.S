@@ -92,7 +92,7 @@ _start:
     svc #0
     cmn x0, #2
     b.ne fail_errno
-    // Out-of-scope paths and write modes must be explicit refusals.
+    // Out-of-scope paths and unsupported open flags must be explicit refusals.
     mov x0, #-100
     adr x1, relative_path
     mov x2, #0
@@ -106,7 +106,7 @@ _start:
     b.ne fail_errno
     mov x0, #-100
     adr x1, input_path
-    mov x2, #1
+    mov x2, #0x8000
     svc #0
     cmn x0, #95
     b.ne fail_errno

@@ -72,6 +72,26 @@ the 128-byte Linux AArch64 UAPI layout defined in `include/linux_aarch64.h`.
 Host structure layout is not assumed to equal the guest's. Direct execution
 of the same guest exercises the kernel's actual ABI for comparison.
 
+Virtual memory and system identity ABI support adds `uname`, `brk`, `mmap`,
+`munmap`, and `mprotect`. The runtime maintains an emulated program break (`brk`)
+starting immediately above the loaded ELF segments and stubs. Anonymous `mmap`
+allocations enforce W^X (strictly denying concurrent `PROT_WRITE | PROT_EXEC`)
+and reject destructive `MAP_FIXED` requests to protect the host process layout.
+System identity (`uname`) is marshalled into standard 390-byte Linux `struct utsname`.
+
+Process identity and credentials support adds `getpid`, `getppid`, `getuid`,
+`geteuid`, `getgid`, `getegid`, and `gettid`, forwarding thread and user context.
+Directory I/O and filesystem mutation support adds `getdents64`, `mkdirat`,
+`unlinkat` (supporting both files and `AT_REMOVEDIR`), and full file creation/mutation
+flags in `openat` (`O_CREAT`, `O_EXCL`, `O_TRUNC`, `O_APPEND`, `O_WRONLY`, `O_RDWR`).
+All file and directory paths are validated against `..` traversals (`-EACCES`) and
+relative paths (`-EOPNOTSUPP`) before resolution relative to `root_fd`.
+A freestanding micro-libc layer (`examples/micro-libc.h`) builds on these primitives
+to provide dynamic heap allocation (`mini_malloc` / `mini_free` backed by `mmap`
+and `munmap` with allocation headers), standard process helpers, and formatted
+console output for standalone C applications like `examples/mini-ls.c` and
+`tests/fs-mut.c`.
+
 This is compatibility routing, not confinement. Guest pointers are trusted;
 invalid non-null pathname pointers can crash the process. File descriptors are
 shared, symlinks are not contained, and malicious control flow can bypass metadata

@@ -29,7 +29,7 @@ mkdir -p build
     clang --version
 } > build/device-info.txt
 # Rebuild only generated targets, to avoid reusing a cloud/glibc executable.
-rm -f build/lnative build/probe build/file-scan build/file-abi
+rm -f build/lnative build/probe build/file-scan build/file-abi build/mem-abi build/mini-ls build/fs-mut
 if make CC=clang LDFLAGS= > build/device-build.log 2>&1; then
     cat build/device-build.log
 else

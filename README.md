@@ -17,9 +17,12 @@ QEMU is used only to test ARM64 code on x86_64 development machines.
 - Cross-compiled with GCC 14 and executed with QEMU user mode 10 on Linux x86_64.
 - Milestone 0's 23 tests passed on the user's Poco F3 according to their report:
   Android 17 / SDK 37, kernel 4.19, 4 KiB pages, Clang 21.1.8 in Termux.
-- The current suite has 32 tests, adding direct-vs-runtime execution of a C
-  program, file metadata, seeking and argument handling to the original checks.
-  The expanded suite passes under QEMU; its Android run is pending.
+- The current suite has 38 tests, adding direct-vs-runtime execution of C
+  programs, file metadata, seeking, directory traversal (`getdents64`), process credentials
+  (`getpid`, `getuid`, etc.), filesystem mutation (`mkdirat`, `unlinkat`, `openat` with
+  `O_CREAT`/`O_WRONLY`/`O_RDWR`/`O_TRUNC`/`O_APPEND`/`O_EXCL`), micro-libc dynamic memory
+  allocation (`mmap`, `munmap`, `mprotect`, `brk`), and system identification (`uname`).
+  All 38 tests pass natively on Android ARM64 (Poco F3, Android 17 / SDK 37, Clang 21.1.8 in Termux).
 - See [validation evidence and limits](docs/validation.md). Other devices and
   16 KiB pages remain unverified. Remote CI results have not been verified here.
 
@@ -99,6 +102,17 @@ omit `qemu-aarch64` after building with `tools/test-termux.sh`. The C executable
 has no dependency on the runtime but uses a custom linker layout and no libc;
 this is a step toward existing Debian binaries, not general support for them.
 
+### Standalone micro-libc application (`mini-ls`)
+
+A standalone application compiled with `examples/micro-libc.h` runs directly on Linux ARM64
+and through LinuxNative, demonstrating dynamic memory allocation (`mini_malloc`/`mini_free` via `mmap`/`munmap`),
+process credentials, and directory listing (`getdents64`):
+
+```sh
+build/mini-ls build
+build/lnative --root "$PWD" build/mini-ls /build
+```
+
 ## Current prototype contract
 
 - Trusted, little-endian AArch64 `ET_EXEC`; static, non-PIE, without TLS.
@@ -109,8 +123,11 @@ this is a step toward existing Debian binaries, not general support for them.
 - Single thread; no guest signals, process creation, dynamic loading, JIT,
   self-modifying code, SVE/SME, or modifications to the host TLS pointer.
 - Valid guest pointers and aligned, sufficiently sized guest stacks.
-- Syscalls: `openat` (absolute paths, read-only, optionally `O_CLOEXEC`), `read`,
-  `write`, `close`, `fstat`, `lseek`, `exit`, `exit_group`.
+- Syscalls: `mkdirat`, `unlinkat`, `openat` (absolute paths, `O_RDONLY`, `O_WRONLY`,
+  `O_RDWR`, `O_CREAT`, `O_EXCL`, `O_TRUNC`, `O_APPEND`, `O_DIRECTORY`, `O_CLOEXEC`),
+  `read`, `write`, `close`, `fstat`, `lseek`, `getdents64`, `uname`,
+  `getpid`, `getppid`, `getuid`, `geteuid`, `getgid`, `getegid`, `gettid`,
+  `brk`, `mmap`, `munmap`, `mprotect`, `exit`, `exit_group`.
   Others return raw `-ENOSYS`. Metadata is converted to the Linux AArch64 ABI.
 - CLI: `lnative [--verbose] --root DIRECTORY STATIC_ELF [ARG...]`.
   Arguments are copied to a 16-byte-aligned guest stack with a bounded budget.

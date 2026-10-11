@@ -15,6 +15,9 @@ RUNTIME = PROJECT / "build/lnative"
 PROBE = PROJECT / "build/probe"
 FILE_SCAN = PROJECT / "build/file-scan"
 FILE_ABI = PROJECT / "build/file-abi"
+MEM_ABI = PROJECT / "build/mem-abi"
+MINI_LS = PROJECT / "build/mini-ls"
+FS_MUT = PROJECT / "build/fs-mut"
 RUNNER = []
 
 
@@ -255,6 +258,65 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(native.returncode, 3)
         self.assertEqual(translated.returncode, 3)
         self.assertEqual(translated.stderr, native.stderr)
+
+    def test_memory_abi_matches_direct_execution(self):
+        native = self.run_direct(MEM_ABI)
+        translated = self.run_guest(MEM_ABI, verbose=True)
+        self.assertEqual(native.returncode, 0, native.stderr.decode())
+        self.assertEqual(translated.returncode, 0, translated.stderr.decode())
+        self.assertEqual(translated.stdout, native.stdout)
+        self.assertEqual(translated.stdout, b"memory ABI ok\n")
+        self.assertIn(b"patched 19 SVC sites", translated.stderr)
+        self.assertIn(b"syscall 160 -> 0", translated.stderr)
+        self.assertIn(b"syscall 214", translated.stderr)
+        self.assertIn(b"syscall 222", translated.stderr)
+
+    def test_memory_security_policies_enforced(self):
+        result = self.run_guest(MEM_ABI, args=["--security-check"])
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertEqual(result.stdout, b"security policy ok\n")
+
+    def test_mini_ls_directory_listing_and_heap_matches_direct_execution(self):
+        native = self.run_direct(MINI_LS, [str(self.root / "etc")])
+        translated = self.run_guest(MINI_LS, args=["/etc"], verbose=True)
+        self.assertEqual(native.returncode, 0, native.stderr.decode())
+        self.assertEqual(translated.returncode, 0, translated.stderr.decode())
+        self.assertIn(b"entry: linuxnative-probe.txt type: 8\n", translated.stdout)
+        self.assertIn(b"entries counted: 3\n", translated.stdout)
+        self.assertIn(b"entries counted: 3\n", native.stdout)
+        self.assertIn(b"syscall 172", translated.stderr)
+        self.assertIn(b"syscall 174", translated.stderr)
+        self.assertIn(b"syscall 61", translated.stderr)
+        self.assertIn(b"syscall 222", translated.stderr)
+        self.assertIn(b"syscall 215", translated.stderr)
+
+    def test_mini_ls_non_directory_rejected(self):
+        native = self.run_direct(MINI_LS, [str(self.root / "etc/linuxnative-probe.txt")])
+        translated = self.run_guest(MINI_LS, args=["/etc/linuxnative-probe.txt"])
+        self.assertEqual(native.returncode, 1)
+        self.assertEqual(translated.returncode, 1)
+        self.assertIn(b"mini-ls: open failed\n", translated.stdout)
+        self.assertIn(b"mini-ls: open failed\n", native.stdout)
+        self.assertIn(f"uid: {os.getuid()}\n".encode(), translated.stdout)
+        self.assertIn(f"uid: {os.getuid()}\n".encode(), native.stdout)
+
+    def test_filesystem_mutation_matches_direct_execution(self):
+        base_native = str(self.directory / "testdir")
+        native = self.run_direct(FS_MUT, [base_native])
+        translated = self.run_guest(FS_MUT, args=["/testdir"], verbose=True)
+        self.assertEqual(native.returncode, 0, native.stderr.decode())
+        self.assertEqual(translated.returncode, 0, translated.stderr.decode())
+        self.assertEqual(native.stdout, b"fs mutation ok\n")
+        self.assertEqual(translated.stdout, b"fs mutation ok\n")
+        self.assertIn(b"syscall 34", translated.stderr)
+        self.assertIn(b"syscall 35", translated.stderr)
+        self.assertIn(b"syscall 56", translated.stderr)
+        self.assertIn(b"syscall 64", translated.stderr)
+
+    def test_filesystem_security_policies_enforced(self):
+        result = self.run_guest(FS_MUT, args=["--security-check"])
+        self.assertEqual(result.returncode, 0, result.stderr.decode())
+        self.assertEqual(result.stdout, b"fs security policy ok\n")
 
 
 if __name__ == "__main__":

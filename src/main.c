@@ -26,6 +26,7 @@ int main(int argc, char **argv)
     struct ln_image image = {0};
     if (ln_load(argv[3], &image))
         return 1;
+    ln_runtime_set_bounds((uintptr_t)image.base, image.size);
     size_t page = (size_t)sysconf(_SC_PAGESIZE);
     size_t stack_size = 1024 * 1024;
     size_t guest_argc = (size_t)argc - 3;
