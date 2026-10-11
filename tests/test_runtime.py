@@ -486,6 +486,52 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(res_exec.returncode, 42)
         self.assertEqual(res_exec.stdout, b"BUBBLE_SORT_PASSED\n")
 
+    def test_x86_to_arm64_sse_floating_point(self):
+        transpiler = Path(__file__).resolve().parent.parent / "tools" / "x86_transpile.py"
+        if not transpiler.exists():
+            self.skipTest("x86 transpiler tool not found")
+
+        c_src = self.directory / "fp_prog.c"
+        x86_elf = self.directory / "fp_x86.elf"
+        arm_elf = self.directory / "fp_arm.elf"
+
+        c_src.write_text(
+            "__attribute__((noinline)) float f_calc(float a, float b) { return (a * b) + 2.5f; }\n"
+            "__attribute__((noinline)) double d_calc(double a, double b) { return (a + b) * 2.0; }\n"
+            "void _start(void) {\n"
+            "    volatile float fa = 10.0f, fb = 5.0f;\n"
+            "    volatile double da = 20.0, db = 30.0;\n"
+            "    int fi = (int)f_calc(fa, fb);\n"
+            "    int di = (int)d_calc(da, db);\n"
+            "    if (fi == 52 && di == 100) {\n"
+            "        const char msg[] = \"FP_SSE_PASSED\\n\";\n"
+            "        register long rax __asm__(\"rax\") = 1;\n"
+            "        register long rdi __asm__(\"rdi\") = 1;\n"
+            "        register const char *rsi __asm__(\"rsi\") = msg;\n"
+            "        register unsigned long rdx __asm__(\"rdx\") = 14;\n"
+            "        __asm__ volatile(\"syscall\" : \"+r\"(rax) : \"r\"(rdi), \"r\"(rsi), \"r\"(rdx) : \"rcx\", \"r11\", \"memory\");\n"
+            "    }\n"
+            "    register long rax __asm__(\"rax\") = 60;\n"
+            "    register long rdi __asm__(\"rdi\") = 99;\n"
+            "    __asm__ volatile(\"syscall\" : \"+r\"(rax) : \"r\"(rdi) : \"memory\");\n"
+            "}\n"
+        )
+
+        res_cc = subprocess.run([
+            "clang", "--target=x86_64-linux-gnu", "-O2", "-ffreestanding",
+            "-fno-builtin", "-nostdlib", "-static",
+            str(c_src), "-o", str(x86_elf)
+        ], capture_output=True)
+        if res_cc.returncode != 0:
+            self.skipTest("clang x86_64 target compilation unavailable")
+
+        subprocess.run(["python3", str(transpiler), str(x86_elf), "-o", str(arm_elf)], check=True)
+        self.assertTrue(arm_elf.exists())
+
+        res_exec = subprocess.run([str(arm_elf)], capture_output=True)
+        self.assertEqual(res_exec.returncode, 99)
+        self.assertEqual(res_exec.stdout, b"FP_SSE_PASSED\n")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
