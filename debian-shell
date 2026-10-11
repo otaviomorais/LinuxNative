@@ -2,7 +2,8 @@
 # Launcher para entrar no terminal Debian interativo via LinuxNative
 set -e
 
-DIR="$(cd "$(dirname "$0")" && pwd)"
+SCRIPT="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
+DIR="$(cd "$(dirname "$SCRIPT")" && pwd)"
 ROOT_DIR="${LN_ROOT:-/data/data/com.termux/files/usr/glibc}"
 
 if [ ! -f "$DIR/build/lnative" ]; then
