@@ -9,6 +9,9 @@ struct ln_image {
     size_t size;
     uintptr_t entry;
     size_t sites;
+    uintptr_t phdr;
+    size_t phent;
+    size_t phnum;
 };
 
 int ln_load(const char *path, struct ln_image *image);

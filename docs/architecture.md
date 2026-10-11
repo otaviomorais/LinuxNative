@@ -15,50 +15,56 @@ guest SVC site -> B stub -> BLR runtime gateway -> C syscall dispatcher
 
 ## Decoder boundary
 
-The loader does not claim to disassemble arbitrary stripped executables. It
-requires AArch64 ABI mapping symbols (`$x` for code, `$d` for data), checks their
-ranges against section and segment bounds, and scans only aligned instruction
-regions. A fixture contains a `0xd4000001` data word inside its executable section;
-the probe verifies that this word is not rewritten.
-
-This dependency excludes many distribution binaries. Future stripped-binary
-support needs a more complete execution-control strategy; removing this check
-and scanning raw bytes is not an acceptable substitute.
+The loader provides a dual-mode rewriting strategy:
+1. When ELF symbol tables and AAPCS64 ABI mapping symbols (`$x` for code, `$d` for data) are
+   present, ranges are strictly verified against section and segment bounds, and only code
+   regions are scanned. Data literals (such as `0xd4000001` constants embedded in code)
+   are never rewritten.
+2. When the binary is stripped (`.symtab` absent), the loader performs a linear 32-bit
+   instruction scan across all executable sections (`SHF_ALLOC | SHF_EXECINSTR`) searching
+   for `0xd4000001` (`svc #0`). Section headers must remain present (`e_shnum > 0`).
 
 ## Loading and permissions
 
 ELF headers, table sizes, segment bounds, entry point, symbol strings, and mapping
 regions are checked before mapping executable code. File size is bounded to
-64 MiB, image span to 32 MiB, and patched sites to 65,536. Dynamic/TLS segments,
-overlapping pages and writable executable segments are rejected.
+64 MiB, image span to 32 MiB, and patched sites to 65,536. Overlapping pages and
+writable executable segments are rejected.
 
 The loader supports fixed-address `ET_EXEC` binaries via `MAP_FIXED_NOREPLACE`
-as well as relocatable static PIE (`ET_DYN`) binaries via anonymous `mmap(NULL, ...)`.
+as well as relocatable static PIE / dynamic (`ET_DYN`) binaries via anonymous `mmap(NULL, ...)`.
 For `ET_DYN`, the loader assigns an available base address (`load_bias`), shifts all segment
-and stub targets by `load_bias`, and sets the entry point accordingly. For `ET_EXEC`,
-it refuses collisions and kernels that ignore `MAP_FIXED_NOREPLACE`; it never falls back
+and stub targets by `load_bias`, and sets the entry point accordingly. Dynamic segments (`PT_DYNAMIC`)
+are permitted for `ET_DYN` images (enabling dynamic linkers like `ld-linux-aarch64.so.1`) while
+rejected on `ET_EXEC`. BSS regions (`p_memsz > p_filesz`) are explicitly zero-filled.
+For `ET_EXEC`, it refuses collisions and kernels that ignore `MAP_FIXED_NOREPLACE`; it never falls back
 to destructive `MAP_FIXED`. The reservation starts PROT_NONE, segments become RW for
 copying/patching, and code becomes RX after cache maintenance. The stub area follows the
 same RW-to-RX sequence. There is no RWX mapping. Segment alignment is checked against the
 runtime's actual page size; the test linker script separates segments at 64 KiB boundaries.
 
-## Gateway ABI
+## Gateway ABI and TLS isolation
 
 The stub saves x16, x17 and the guest LR, loads the absolute gateway address,
 calls it, restores those registers, and branches back. The gateway saves x0-x30,
 NZCV, FPCR/FPSR and all 32 128-bit NEON registers; only x0 becomes the syscall
 result. SVE/SME state is not supported. SP remains 16-byte aligned and is restored.
 
-Before calling host C code, the gateway restores the host x18 captured at entry,
-because Android reserves that register (including for shadow call stacks).
-This is a synchronous, single-thread experiment, not signal-safe Android ABI
-support. Guest code must not alter TPIDR_EL0 or otherwise corrupt host TLS.
+Before calling host C code, the gateway performs critical host state isolation:
+- Restores host `x18` captured at entry (reserved by Android for shadow call stacks).
+- Restores host `tpidr_el0` (Android Bionic TLS pointer). On AArch64, `tpidr_el0` is
+  user-writable (`msr tpidr_el0, x0`). When guest libraries such as glibc initialize
+  their own TLS, host Bionic libc functions (`errno`, thread state) would crash if
+  dereferenced against the foreign TLS pointer. The gateway saves the guest `tpidr_el0`
+  on the stack and swaps in `ln_host_tpidr` before invoking `ln_dispatch`, restoring
+  the guest `tpidr_el0` before returning to guest execution.
 
 There is one host process and a separate guarded guest stack. The initial stack
-contains argc/argv (including supplied arguments), an empty environment,
-AT_PAGESZ and AT_NULL; it is not a complete Linux auxiliary vector. Arguments
-and their pointer table may occupy at most half of the 1 MiB stack; the initial
-SP is aligned to 16 bytes. The supported exit syscalls terminate this
+contains argc/argv, an empty environment, and a standard Linux auxiliary vector (`auxv`):
+`AT_PHDR`, `AT_PHENT`, `AT_PHNUM`, `AT_PAGESZ`, `AT_ENTRY`, `AT_BASE`, `AT_FLAGS`,
+`AT_UID`, `AT_EUID`, `AT_GID`, `AT_EGID`, `AT_SECURE`, `AT_RANDOM` (16 bytes random seed),
+`AT_CLKTCK` (100), and `AT_NULL`. Arguments and auxiliary vectors are bounded to half of
+the 1 MiB stack; SP is aligned to 16 bytes. The supported exit syscalls terminate this
 process with the guest's status.
 
 ## Compatibility policy

@@ -331,6 +331,46 @@ class RuntimeTests(unittest.TestCase):
         self.assertIn(b"syscall 222", translated.stderr)
         self.assertIn(b"syscall 215", translated.stderr)
 
+    def test_stripped_binary_matches_direct_execution(self):
+        stripped = self.directory / "file-scan.stripped"
+        data = bytearray(FILE_SCAN.read_bytes())
+        stripped.write_bytes(data)
+        subprocess.run(["strip", str(stripped)], check=True)
+        path = self.root / "etc/linuxnative-probe.txt"
+        native = self.run_direct(FILE_SCAN, [str(path)])
+        translated = self.run_guest(stripped, args=["/etc/linuxnative-probe.txt"], verbose=True)
+        self.assertEqual(translated.returncode, 0, translated.stderr.decode())
+        self.assertEqual(translated.stdout, native.stdout)
+        self.assertIn(b"patched 19 SVC sites", translated.stderr)
+
+    def test_stripped_mini_ls_matches_direct_execution(self):
+        stripped = self.directory / "mini-ls.stripped"
+        data = bytearray(MINI_LS.read_bytes())
+        stripped.write_bytes(data)
+        subprocess.run(["strip", str(stripped)], check=True)
+        native = self.run_direct(MINI_LS, [str(self.root / "etc")])
+        translated = self.run_guest(stripped, args=["/etc"], verbose=True)
+        self.assertEqual(translated.returncode, 0, translated.stderr.decode())
+        self.assertIn(b"entries counted: 3\n", translated.stdout)
+        self.assertIn(b"entries counted: 3\n", native.stdout)
+
+    def test_glibc_ldso_and_debian_utilities(self):
+        ldso = Path("/data/data/com.termux/files/usr/glibc/lib/ld-linux-aarch64.so.1")
+        glibc_root = Path("/data/data/com.termux/files/usr/glibc")
+        if not ldso.exists() or not (glibc_root / "bin/true").exists():
+            self.skipTest("glibc environment not available")
+        # 1. Test /bin/true
+        res_true = self.run_guest(ldso, root=glibc_root, args=["--library-path", "/lib", "/bin/true"], verbose=True)
+        self.assertEqual(res_true.returncode, 0, res_true.stderr.decode())
+        # 2. Test /bin/uname -s
+        res_uname = self.run_guest(ldso, root=glibc_root, args=["--library-path", "/lib", "/bin/uname", "-s"])
+        self.assertEqual(res_uname.returncode, 0, res_uname.stderr.decode())
+        self.assertEqual(res_uname.stdout, b"Linux\n")
+        # 3. Test /bin/echo
+        res_echo = self.run_guest(ldso, root=glibc_root, args=["--library-path", "/lib", "/bin/echo", "DebianOK"])
+        self.assertEqual(res_echo.returncode, 0, res_echo.stderr.decode())
+        self.assertEqual(res_echo.stdout, b"DebianOK\n")
+
 
 
 if __name__ == "__main__":

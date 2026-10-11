@@ -7,17 +7,26 @@
 /* Linux AArch64 asm-generic syscall numbers and UAPI stat layout.
  * Guest ABI definitions, independent of the runtime's host libc. */
 enum {
+    LN_FCNTL = 25,
+    LN_IOCTL = 29,
     LN_MKDIRAT = 34,
     LN_UNLINKAT = 35,
+    LN_FACCESSAT = 48,
     LN_OPENAT = 56, LN_CLOSE = 57, LN_GETDENTS64 = 61, LN_LSEEK = 62,
-    LN_READ = 63, LN_WRITE = 64, LN_FSTAT = 80,
+    LN_READ = 63, LN_WRITE = 64, LN_READV = 65, LN_WRITEV = 66,
+    LN_READLINKAT = 78, LN_NEWFSTATAT = 79, LN_FSTAT = 80,
     LN_EXIT = 93, LN_EXIT_GROUP = 94,
+    LN_SET_TID_ADDRESS = 96, LN_SET_ROBUST_LIST = 99,
+    LN_NANOSLEEP = 101, LN_CLOCK_GETTIME = 113,
+    LN_RT_SIGACTION = 134, LN_RT_SIGPROCMASK = 135,
     LN_UNAME = 160,
     LN_GETPID = 172, LN_GETPPID = 173,
     LN_GETUID = 174, LN_GETEUID = 175,
     LN_GETGID = 176, LN_GETEGID = 177,
     LN_GETTID = 178,
-    LN_BRK = 214, LN_MUNMAP = 215, LN_MMAP = 222, LN_MPROTECT = 226
+    LN_BRK = 214, LN_MUNMAP = 215, LN_MMAP = 222, LN_MPROTECT = 226,
+    LN_MADVISE = 233,
+    LN_PRLIMIT64 = 261, LN_GETRANDOM = 278
 };
 
 enum {

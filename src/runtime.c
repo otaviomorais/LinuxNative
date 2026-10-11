@@ -4,12 +4,18 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/ioctl.h>
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
+#include <sys/uio.h>
 #include <sys/utsname.h>
+#include <time.h>
 #include <unistd.h>
 
 #ifndef MAP_FIXED_NOREPLACE
@@ -70,7 +76,12 @@ static long guest_open(const uint64_t *r)
     long err = guest_resolve_path((const char *)(uintptr_t)r[1], &rel_path);
     if (err) return err;
 
-    uint64_t allowed = O_ACCMODE | O_CLOEXEC | O_DIRECTORY | O_CREAT | O_EXCL | O_TRUNC | O_APPEND;
+#ifndef O_LARGEFILE
+#define O_LARGEFILE 0x8000
+#endif
+
+    uint64_t allowed = O_ACCMODE | O_CLOEXEC | O_DIRECTORY | O_CREAT | O_EXCL | O_TRUNC | O_APPEND |
+                       O_NONBLOCK | O_NOCTTY | O_LARGEFILE;
     if (r[2] & ~allowed)
         return -EOPNOTSUPP;
 
@@ -104,27 +115,90 @@ static long guest_unlinkat(const uint64_t *r)
     return 0;
 }
 
+static int marshal_stat(const struct stat *host, void *guest_statbuf)
+{
+    uint64_t links = host->st_nlink;
+    int64_t block_size = host->st_blksize;
+    if (links > UINT32_MAX || block_size > INT32_MAX || block_size < 0)
+        return -EOVERFLOW;
+    /* Do not memcpy host struct stat: Bionic/glibc layout is not our ABI. */
+    struct ln_stat guest = {
+        .dev = host->st_dev, .ino = host->st_ino, .mode = host->st_mode,
+        .nlink = host->st_nlink, .uid = host->st_uid, .gid = host->st_gid,
+        .rdev = host->st_rdev, .size = host->st_size, .blksize = host->st_blksize,
+        .blocks = host->st_blocks,
+        .atime_sec = host->st_atim.tv_sec, .atime_nsec = host->st_atim.tv_nsec,
+        .mtime_sec = host->st_mtim.tv_sec, .mtime_nsec = host->st_mtim.tv_nsec,
+        .ctime_sec = host->st_ctim.tv_sec, .ctime_nsec = host->st_ctim.tv_nsec
+    };
+    memcpy(guest_statbuf, &guest, sizeof(guest));
+    return 0;
+}
+
 static long guest_fstat(const uint64_t *r)
 {
     if (!r[1]) return -EFAULT;
     struct stat host;
     if (fstat((int)r[0], &host)) return -errno;
-    uint64_t links = host.st_nlink;
-    int64_t block_size = host.st_blksize;
-    if (links > UINT32_MAX || block_size > INT32_MAX || block_size < 0)
-        return -EOVERFLOW;
-    /* Do not memcpy host struct stat: Bionic/glibc layout is not our ABI. */
-    struct ln_stat guest = {
-        .dev = host.st_dev, .ino = host.st_ino, .mode = host.st_mode,
-        .nlink = host.st_nlink, .uid = host.st_uid, .gid = host.st_gid,
-        .rdev = host.st_rdev, .size = host.st_size, .blksize = host.st_blksize,
-        .blocks = host.st_blocks,
-        .atime_sec = host.st_atim.tv_sec, .atime_nsec = host.st_atim.tv_nsec,
-        .mtime_sec = host.st_mtim.tv_sec, .mtime_nsec = host.st_mtim.tv_nsec,
-        .ctime_sec = host.st_ctim.tv_sec, .ctime_nsec = host.st_ctim.tv_nsec
-    };
-    memcpy((void *)(uintptr_t)r[1], &guest, sizeof(guest));
+    return marshal_stat(&host, (void *)(uintptr_t)r[1]);
+}
+
+static long guest_newfstatat(const uint64_t *r)
+{
+    int dirfd = (int)(int64_t)r[0];
+    const char *path = (const char *)(uintptr_t)r[1];
+    void *statbuf = (void *)(uintptr_t)r[2];
+    int flags = (int)r[3];
+
+    if (!statbuf) return -EFAULT;
+
+    struct stat host;
+    int ret;
+    if ((flags & 0x1000 /* AT_EMPTY_PATH */) && path && path[0] == '\0') {
+        ret = fstat(dirfd, &host);
+    } else {
+        const char *rel_path = NULL;
+        long err = guest_resolve_path(path, &rel_path);
+        if (err) return err;
+        ret = fstatat(root_fd, rel_path, &host, flags & ~0x1000);
+    }
+    if (ret < 0) return -errno;
+    return marshal_stat(&host, statbuf);
+}
+
+static long guest_faccessat(const uint64_t *r)
+{
+    const char *path = (const char *)(uintptr_t)r[1];
+    int mode = (int)r[2];
+
+    const char *rel_path = NULL;
+    long err = guest_resolve_path(path, &rel_path);
+    if (err) return err;
+
+    if (faccessat(root_fd, rel_path, mode, 0))
+        return -errno;
     return 0;
+}
+
+static long guest_readlinkat(const uint64_t *r)
+{
+    const char *path = (const char *)(uintptr_t)r[1];
+    char *buf = (char *)(uintptr_t)r[2];
+    size_t bufsiz = (size_t)r[3];
+
+    if (!path || !buf) return -EFAULT;
+
+    ssize_t ret;
+    if (!strncmp(path, "/proc/", 6)) {
+        ret = readlinkat(AT_FDCWD, path, buf, bufsiz);
+    } else {
+        const char *rel_path = NULL;
+        long err = guest_resolve_path(path, &rel_path);
+        if (err) return err;
+        ret = readlinkat(root_fd, rel_path, buf, bufsiz);
+    }
+    if (ret < 0) return -errno;
+    return ret;
 }
 
 static long guest_uname(const uint64_t *r)
@@ -184,8 +258,12 @@ static long guest_mmap(const uint64_t *r)
     if ((prot & (PROT_WRITE | PROT_EXEC)) == (PROT_WRITE | PROT_EXEC))
         return -EACCES;
 
-    if (flags & MAP_FIXED)
-        return -EOPNOTSUPP;
+    if (flags & MAP_FIXED) {
+        if ((uintptr_t)addr < (1ULL << 32))
+            return -EOPNOTSUPP;
+    }
+
+    flags &= ~0x800; /* MAP_DENYWRITE */
 
     if (flags & MAP_ANONYMOUS) {
         fd = -1;
@@ -251,10 +329,170 @@ static long guest_getdents64(const uint64_t *r)
     return n;
 }
 
+static long guest_prlimit64(const uint64_t *r)
+{
+    pid_t pid = (pid_t)(int64_t)r[0];
+    int resource = (int)r[1];
+    const struct rlimit *new_limit = (const void *)(uintptr_t)r[2];
+    struct rlimit *old_limit = (void *)(uintptr_t)r[3];
+
+    int ret = syscall(SYS_prlimit64, pid, resource, new_limit, old_limit);
+    if (ret < 0) return -errno;
+    return 0;
+}
+
+static long guest_getrandom(const uint64_t *r)
+{
+    void *buf = (void *)(uintptr_t)r[0];
+    size_t buflen = (size_t)r[1];
+    unsigned int flags = (unsigned int)r[2];
+
+    long ret = syscall(SYS_getrandom, buf, buflen, flags);
+    if (ret < 0) return -errno;
+    return ret;
+}
+
+static long guest_ioctl(const uint64_t *r)
+{
+    int fd = (int)r[0];
+    unsigned long request = (unsigned long)r[1];
+    void *arg = (void *)(uintptr_t)r[2];
+
+    int ret = ioctl(fd, request, arg);
+    if (ret < 0) return -errno;
+    return ret;
+}
+
+static long guest_fcntl(const uint64_t *r)
+{
+    int fd = (int)r[0];
+    int cmd = (int)r[1];
+    void *arg = (void *)(uintptr_t)r[2];
+
+    int ret = fcntl(fd, cmd, arg);
+    if (ret < 0) return -errno;
+    return ret;
+}
+
+static long guest_readv(const uint64_t *r)
+{
+    int fd = (int)r[0];
+    const struct iovec *iov = (const void *)(uintptr_t)r[1];
+    int vlen = (int)r[2];
+
+    ssize_t ret = readv(fd, iov, vlen);
+    if (ret < 0) return -errno;
+    return ret;
+}
+
+static long guest_writev(const uint64_t *r)
+{
+    int fd = (int)r[0];
+    const struct iovec *iov = (const void *)(uintptr_t)r[1];
+    int vlen = (int)r[2];
+
+    ssize_t ret = writev(fd, iov, vlen);
+    if (ret < 0) return -errno;
+    return ret;
+}
+
+static long guest_clock_gettime(const uint64_t *r)
+{
+    clockid_t clk_id = (clockid_t)r[0];
+    struct timespec *tp = (void *)(uintptr_t)r[1];
+
+    if (!tp) return -EFAULT;
+    if (clock_gettime(clk_id, tp)) return -errno;
+    return 0;
+}
+
+static long guest_rt_sigaction(const uint64_t *r)
+{
+    int signum = (int)r[0];
+    const void *act = (const void *)(uintptr_t)r[1];
+    void *oldact = (void *)(uintptr_t)r[2];
+    size_t sigsetsize = (size_t)r[3];
+
+    long ret = syscall(SYS_rt_sigaction, signum, act, oldact, sigsetsize);
+    if (ret < 0) return -errno;
+    return 0;
+}
+
+static long guest_rt_sigprocmask(const uint64_t *r)
+{
+    int how = (int)r[0];
+    const void *set = (const void *)(uintptr_t)r[1];
+    void *oset = (void *)(uintptr_t)r[2];
+    size_t sigsetsize = (size_t)r[3];
+
+    long ret = syscall(SYS_rt_sigprocmask, how, set, oset, sigsetsize);
+    if (ret < 0) return -errno;
+    return 0;
+}
+
+static long guest_madvise(const uint64_t *r)
+{
+    void *addr = (void *)(uintptr_t)r[0];
+    size_t length = (size_t)r[1];
+    int advice = (int)r[2];
+
+    if (madvise(addr, length, advice)) return -errno;
+    return 0;
+}
+
+static long guest_nanosleep(const uint64_t *r)
+{
+    const struct timespec *req = (const void *)(uintptr_t)r[0];
+    struct timespec *rem = (void *)(uintptr_t)r[1];
+
+    if (!req) return -EFAULT;
+    if (nanosleep(req, rem)) return -errno;
+    return 0;
+}
+
 uint64_t ln_dispatch(uint64_t *r)
 {
     long result;
     switch (r[8]) {
+    case LN_FCNTL:
+        result = guest_fcntl(r);
+        break;
+    case LN_IOCTL:
+        result = guest_ioctl(r);
+        break;
+    case LN_FACCESSAT:
+        result = guest_faccessat(r);
+        break;
+    case LN_READV:
+        result = guest_readv(r);
+        break;
+    case LN_WRITEV:
+        result = guest_writev(r);
+        break;
+    case LN_READLINKAT:
+        result = guest_readlinkat(r);
+        break;
+    case LN_NEWFSTATAT:
+        result = guest_newfstatat(r);
+        break;
+    case LN_SET_TID_ADDRESS:
+        result = getpid();
+        break;
+    case LN_SET_ROBUST_LIST:
+        result = 0;
+        break;
+    case LN_NANOSLEEP:
+        result = guest_nanosleep(r);
+        break;
+    case LN_CLOCK_GETTIME:
+        result = guest_clock_gettime(r);
+        break;
+    case LN_RT_SIGACTION:
+        result = guest_rt_sigaction(r);
+        break;
+    case LN_RT_SIGPROCMASK:
+        result = guest_rt_sigprocmask(r);
+        break;
     case LN_UNAME:
         result = guest_uname(r);
         break;
@@ -293,6 +531,15 @@ uint64_t ln_dispatch(uint64_t *r)
         break;
     case LN_MPROTECT:
         result = guest_mprotect(r);
+        break;
+    case LN_MADVISE:
+        result = guest_madvise(r);
+        break;
+    case LN_PRLIMIT64:
+        result = guest_prlimit64(r);
+        break;
+    case LN_GETRANDOM:
+        result = guest_getrandom(r);
         break;
     case LN_MKDIRAT:
         result = guest_mkdirat(r);

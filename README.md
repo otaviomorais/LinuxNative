@@ -17,13 +17,14 @@ QEMU is used only to test ARM64 code on x86_64 development machines.
 - Cross-compiled with GCC 14 and executed with QEMU user mode 10 on Linux x86_64.
 - Milestone 0's 23 tests passed on the user's Poco F3 according to their report:
   Android 17 / SDK 37, kernel 4.19, 4 KiB pages, Clang 21.1.8 in Termux.
-- The current suite has 39 tests, adding direct-vs-runtime execution of C
-  programs, static PIE (`ET_DYN`) relocatable binaries, file metadata, seeking,
-  directory traversal (`getdents64`), process credentials (`getpid`, `getuid`, etc.),
-  filesystem mutation (`mkdirat`, `unlinkat`, `openat` with
-  `O_CREAT`/`O_WRONLY`/`O_RDWR`/`O_TRUNC`/`O_APPEND`/`O_EXCL`), micro-libc dynamic memory
-  allocation (`mmap`, `munmap`, `mprotect`, `brk`), and system identification (`uname`).
-  All 39 tests pass natively on Android ARM64 (Poco F3, Android 17 / SDK 37, Clang 21.1.8 in Termux).
+- The current suite has 42 tests, adding direct-vs-runtime execution of C
+  programs, static PIE (`ET_DYN`) relocatable binaries, stripped binaries via linear
+  SVC scanning, full Linux auxiliary vector (`auxv`), thread register isolation
+  (`tpidr_el0`), file metadata, seeking, directory traversal (`getdents64`), process credentials,
+  filesystem mutation, micro-libc dynamic memory allocation (`mmap`, `munmap`, `mprotect`, `brk`),
+  system identification (`uname`), and Debian/glibc dynamic linker and utility execution
+  (`ld-linux-aarch64.so.1`, `/bin/true`, `/bin/uname`, `/bin/echo`, `/bin/ls`).
+  All 42 tests pass natively on Android ARM64 (Poco F3, Android 17 / SDK 37, Clang 21.1.8 in Termux).
 - See [validation evidence and limits](docs/validation.md). Other devices and
   16 KiB pages remain unverified. Remote CI results have not been verified here.
 
@@ -116,20 +117,23 @@ build/lnative --root "$PWD" build/mini-ls /build
 
 ## Current prototype contract
 
-- Trusted, little-endian AArch64 `ET_EXEC` or static PIE (`ET_DYN`); without TLS or dynamic linkers (`PT_INTERP`).
-- Complete AArch64 `$x`/`$d` mapping symbols, retained section/symbol tables,
-  and one code section per executable load segment. Stripped binaries are refused.
+- Trusted, little-endian AArch64 `ET_EXEC` or PIE/DYN (`ET_DYN`) executables, including
+  the glibc dynamic linker `ld-linux-aarch64.so.1`.
+- When ELF symbol tables and AAPCS64 `$x`/`$d` mapping symbols are present, code ranges are
+  scanned precisely to protect data literals. When `.symtab` is stripped, a 32-bit linear
+  instruction scan of executable sections is employed.
 - Non-overlapping load-segment pages, no writable executable segments, and an
   image span no larger than 32 MiB. Fixed guest addresses must be available.
-- Single thread; no guest signals, process creation, dynamic loading, JIT,
-  self-modifying code, SVE/SME, or modifications to the host TLS pointer.
-- Valid guest pointers and aligned, sufficiently sized guest stacks.
-- Syscalls: `mkdirat`, `unlinkat`, `openat` (absolute paths, `O_RDONLY`, `O_WRONLY`,
-  `O_RDWR`, `O_CREAT`, `O_EXCL`, `O_TRUNC`, `O_APPEND`, `O_DIRECTORY`, `O_CLOEXEC`),
-  `read`, `write`, `close`, `fstat`, `lseek`, `getdents64`, `uname`,
-  `getpid`, `getppid`, `getuid`, `geteuid`, `getgid`, `getegid`, `gettid`,
-  `brk`, `mmap`, `munmap`, `mprotect`, `exit`, `exit_group`.
-  Others return raw `-ENOSYS`. Metadata is converted to the Linux AArch64 ABI.
+- Single thread guest execution; host Bionic TLS (`tpidr_el0`) and `x18` are preserved
+  and swapped across the gateway boundary to isolate foreign libc (e.g. glibc) TLS state.
+- Valid guest pointers and 16-byte-aligned guest stack populated with standard Linux
+  auxiliary vector (`auxv`: `AT_PHDR`, `AT_ENTRY`, `AT_BASE`, `AT_PAGESZ`, `AT_RANDOM`, etc.).
+- Syscalls: `fcntl`, `ioctl`, `mkdirat`, `unlinkat`, `openat`, `faccessat`, `read`, `write`,
+  `readv`, `writev`, `close`, `fstat`, `newfstatat`, `readlinkat`, `lseek`, `getdents64`,
+  `uname`, `getpid`, `getppid`, `getuid`, `geteuid`, `getgid`, `getegid`, `gettid`,
+  `set_tid_address`, `set_robust_list`, `nanosleep`, `clock_gettime`, `rt_sigaction`,
+  `rt_sigprocmask`, `brk`, `mmap`, `munmap`, `mprotect`, `madvise`, `prlimit64`,
+  `getrandom`, `exit`, `exit_group`. Others return raw `-ENOSYS`.
 - CLI: `lnative [--verbose] --root DIRECTORY STATIC_ELF [ARG...]`.
   Arguments are copied to a 16-byte-aligned guest stack with a bounded budget.
 - Unsupported open modes and relative paths return `-EOPNOTSUPP`; `..` components

@@ -5,7 +5,7 @@
 .hidden ln_gateway
 .type ln_gateway, %function
 ln_gateway:
-    sub sp, sp, #784
+    sub sp, sp, #800
     stp x0, x1, [sp, #0]
     stp x2, x3, [sp, #16]
     stp x4, x5, [sp, #32]
@@ -44,9 +44,14 @@ ln_gateway:
     stp q26, q27, [sp, #688]
     stp q28, q29, [sp, #720]
     stp q30, q31, [sp, #752]
-    // x18 is reserved by Android (e.g. shadow call stack).
+    mrs x16, tpidr_el0
+    str x16, [sp, #784]
+    // Restore host environment: x18 and tpidr_el0
     adrp x16, ln_host_x18
     ldr x18, [x16, :lo12:ln_host_x18]
+    adrp x16, ln_host_tpidr
+    ldr x16, [x16, :lo12:ln_host_tpidr]
+    msr tpidr_el0, x16
     mov x0, sp
     bl ln_dispatch
     str x0, [sp, #0]
@@ -87,8 +92,10 @@ ln_gateway:
     ldp x24, x25, [sp, #192]
     ldp x26, x27, [sp, #208]
     ldp x28, x29, [sp, #224]
+    ldr x16, [sp, #784]
+    msr tpidr_el0, x16
     ldr x30, [sp, #240]
-    add sp, sp, #784
+    add sp, sp, #800
     ret
 .size ln_gateway, .-ln_gateway
 
@@ -97,6 +104,9 @@ ln_gateway:
 ln_enter:
     adrp x9, ln_host_x18
     str x18, [x9, :lo12:ln_host_x18]
+    mrs x10, tpidr_el0
+    adrp x9, ln_host_tpidr
+    str x10, [x9, :lo12:ln_host_tpidr]
     mov x9, x0
     mov sp, x1
     mov x0, #0
@@ -107,4 +117,5 @@ ln_enter:
 .bss
 .p2align 3
 ln_host_x18: .skip 8
+ln_host_tpidr: .skip 8
 .section .note.GNU-stack,"",%progbits

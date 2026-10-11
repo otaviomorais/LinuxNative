@@ -56,6 +56,7 @@ static int collect_sites(const unsigned char *file, size_t length,
                          const Elf64_Ehdr *eh, const Elf64_Phdr *ph,
                          uint64_t *sites, size_t *count)
 {
+    (void)ph;
     if (!eh->e_shnum || eh->e_shnum > 4096 ||
         eh->e_shentsize != sizeof(Elf64_Shdr) ||
         !inside(eh->e_shoff, (uint64_t)eh->e_shnum * sizeof(Elf64_Shdr), length) ||
@@ -82,64 +83,71 @@ static int collect_sites(const unsigned char *file, size_t length,
         strings = (const void *)(file + str->sh_offset);
         string_size = str->sh_size;
     }
-    if (!symbols || !nsymbols || nsymbols > 1000000)
-        return reject("AArch64 mapping symbols required; stripped ELF unsupported");
-    struct marker *markers = calloc(nsymbols, sizeof(*markers));
-    if (!markers) return reject("out of memory");
+    if (nsymbols > 1000000)
+        return reject("symbol table too large");
+    struct marker *markers = nsymbols ? calloc(nsymbols, sizeof(*markers)) : NULL;
+    if (nsymbols && !markers) return reject("out of memory");
     int result = -1, entry_is_code = 0;
-    for (size_t p = 0; p < eh->e_phnum; ++p) {
-        if (ph[p].p_type != PT_LOAD || !(ph[p].p_flags & PF_X)) continue;
-        size_t section = eh->e_shnum;
-        for (size_t i = 0; i < eh->e_shnum; ++i) {
-            if ((sh[i].sh_flags & (SHF_ALLOC | SHF_EXECINSTR)) == (SHF_ALLOC | SHF_EXECINSTR) &&
-                sh[i].sh_type == SHT_PROGBITS && sh[i].sh_addr == ph[p].p_vaddr &&
-                sh[i].sh_offset == ph[p].p_offset && sh[i].sh_size == ph[p].p_filesz) {
-                if (section != eh->e_shnum) {
-                    reject("ambiguous executable sections"); goto done;
-                }
-                section = i;
-            }
-        }
-        if (section == eh->e_shnum || ph[p].p_memsz != ph[p].p_filesz) {
-            reject("each executable segment must match one complete code section"); goto done;
-        }
+    for (size_t i = 0; i < eh->e_shnum; ++i) {
+        if ((sh[i].sh_flags & (SHF_ALLOC | SHF_EXECINSTR)) != (SHF_ALLOC | SHF_EXECINSTR) ||
+            sh[i].sh_type != SHT_PROGBITS)
+            continue;
+        uint64_t begin = sh[i].sh_addr, end = begin + sh[i].sh_size;
         size_t n = 0;
-        uint64_t begin = sh[section].sh_addr, end = begin + sh[section].sh_size;
-        for (size_t i = 0; i < nsymbols; ++i) {
-            if (symbols[i].st_shndx != section) continue;
-            if (symbols[i].st_name >= string_size ||
-                !memchr(strings + symbols[i].st_name, 0, string_size - symbols[i].st_name)) {
-                reject("invalid symbol name"); goto done;
+        if (markers && symbols && nsymbols) {
+            for (size_t s = 0; s < nsymbols; ++s) {
+                if (symbols[s].st_shndx != i) continue;
+                if (symbols[s].st_name >= string_size ||
+                    !memchr(strings + symbols[s].st_name, 0, string_size - symbols[s].st_name)) {
+                    reject("invalid symbol name"); goto done;
+                }
+                const char *name = strings + symbols[s].st_name;
+                if (name[0] != '$' || (name[1] != 'x' && name[1] != 'd') ||
+                    (name[2] != 0 && name[2] != '.')) continue;
+                if (ELF64_ST_TYPE(symbols[s].st_info) != STT_NOTYPE ||
+                    ELF64_ST_BIND(symbols[s].st_info) != STB_LOCAL ||
+                    symbols[s].st_value < begin || symbols[s].st_value >= end) {
+                    reject("invalid mapping symbol"); goto done;
+                }
+                markers[n++] = (struct marker){symbols[s].st_value, name[1] == 'x'};
             }
-            const char *name = strings + symbols[i].st_name;
-            if (name[0] != '$' || (name[1] != 'x' && name[1] != 'd') ||
-                (name[2] != 0 && name[2] != '.')) continue;
-            if (ELF64_ST_TYPE(symbols[i].st_info) != STT_NOTYPE ||
-                ELF64_ST_BIND(symbols[i].st_info) != STB_LOCAL ||
-                symbols[i].st_value < begin || symbols[i].st_value >= end) {
-                reject("invalid mapping symbol"); goto done;
-            }
-            markers[n++] = (struct marker){symbols[i].st_value, name[1] == 'x'};
         }
-        qsort(markers, n, sizeof(*markers), compare_marker);
-        if (!n || markers[0].address != begin) {
-            reject("mapping symbols must cover the executable section"); goto done;
-        }
-        for (size_t i = 0; i < n; ++i) {
-            uint64_t start = markers[i].address;
-            uint64_t stop = i + 1 < n ? markers[i + 1].address : end;
-            if (start == stop) {
-                reject("ambiguous duplicate mapping symbols"); goto done;
+        if (n > 0) {
+            qsort(markers, n, sizeof(*markers), compare_marker);
+            if (markers[0].address != begin) {
+                reject("mapping symbols must cover the executable section"); goto done;
             }
-            if (!markers[i].code) continue;
-            if ((start | stop) & 3) {
+            for (size_t k = 0; k < n; ++k) {
+                uint64_t start = markers[k].address;
+                uint64_t stop = k + 1 < n ? markers[k + 1].address : end;
+                if (start == stop) {
+                    reject("ambiguous duplicate mapping symbols"); goto done;
+                }
+                if (!markers[k].code) continue;
+                if ((start | stop) & 3) {
+                    reject("unaligned instruction region"); goto done;
+                }
+                if (eh->e_entry >= start && eh->e_entry < stop && !(eh->e_entry & 3))
+                    entry_is_code = 1;
+                for (uint64_t pc = start; pc < stop; pc += 4) {
+                    uint32_t word;
+                    memcpy(&word, file + sh[i].sh_offset + pc - begin, sizeof(word));
+                    if ((word & 0xffe0001fu) != 0xd4000001u) continue;
+                    if (word != 0xd4000001u || *count == MAX_SITES) {
+                        reject("unsupported SVC immediate or too many syscall sites"); goto done;
+                    }
+                    sites[(*count)++] = pc;
+                }
+            }
+        } else {
+            if ((begin | end) & 3) {
                 reject("unaligned instruction region"); goto done;
             }
-            if (eh->e_entry >= start && eh->e_entry < stop && !(eh->e_entry & 3))
+            if (eh->e_entry >= begin && eh->e_entry < end && !(eh->e_entry & 3))
                 entry_is_code = 1;
-            for (uint64_t pc = start; pc < stop; pc += 4) {
+            for (uint64_t pc = begin; pc < end; pc += 4) {
                 uint32_t word;
-                memcpy(&word, file + sh[section].sh_offset + pc - begin, sizeof(word));
+                memcpy(&word, file + sh[i].sh_offset + pc - begin, sizeof(word));
                 if ((word & 0xffe0001fu) != 0xd4000001u) continue;
                 if (word != 0xd4000001u || *count == MAX_SITES) {
                     reject("unsupported SVC immediate or too many syscall sites"); goto done;
@@ -196,7 +204,8 @@ int ln_load(const char *path, struct ln_image *image)
     size_t page = (size_t)sysconf(_SC_PAGESIZE);
     uintptr_t low = UINTPTR_MAX, high = 0;
     for (size_t i = 0; i < eh->e_phnum; ++i) {
-        if (ph[i].p_type == PT_INTERP || ph[i].p_type == PT_DYNAMIC || ph[i].p_type == PT_TLS ||
+        if (ph[i].p_type == PT_INTERP || (eh->e_type == ET_EXEC && ph[i].p_type == PT_DYNAMIC) ||
+            ph[i].p_type == PT_TLS ||
             (ph[i].p_type == PT_GNU_STACK && (ph[i].p_flags & PF_X))) {
             reject("dynamic linking, TLS, and executable stacks unsupported"); goto done;
         }
@@ -254,6 +263,9 @@ int ln_load(const char *path, struct ln_image *image)
             perror("lnative: populate segment"); goto done;
         }
         memcpy((void *)seg_vaddr, file + ph[i].p_offset, ph[i].p_filesz);
+        if (ph[i].p_memsz > ph[i].p_filesz) {
+            memset((void *)(seg_vaddr + ph[i].p_filesz), 0, ph[i].p_memsz - ph[i].p_filesz);
+        }
     }
     uintptr_t stub_base = high + load_bias;
     if (mprotect((void *)stub_base, stub_bytes, PROT_READ | PROT_WRITE)) {
@@ -297,7 +309,27 @@ int ln_load(const char *path, struct ln_image *image)
     if (mprotect((void *)stub_base, stub_bytes, PROT_READ | PROT_EXEC)) {
         perror("lnative: finalize gateways"); goto done;
     }
-    *image = (struct ln_image){mapping, reservation, eh->e_entry + load_bias, count};
+    uintptr_t phdr_addr = 0;
+    for (size_t i = 0; i < eh->e_phnum; ++i) {
+        if (ph[i].p_type == PT_PHDR) {
+            phdr_addr = ph[i].p_vaddr + load_bias;
+            break;
+        }
+    }
+    if (!phdr_addr) {
+        for (size_t i = 0; i < eh->e_phnum; ++i) {
+            if (ph[i].p_type == PT_LOAD &&
+                eh->e_phoff >= ph[i].p_offset &&
+                eh->e_phoff + (uint64_t)eh->e_phnum * sizeof(Elf64_Phdr) <= ph[i].p_offset + ph[i].p_filesz) {
+                phdr_addr = ph[i].p_vaddr + load_bias + (eh->e_phoff - ph[i].p_offset);
+                break;
+            }
+        }
+    }
+    *image = (struct ln_image){
+        mapping, reservation, eh->e_entry + load_bias, count,
+        phdr_addr, eh->e_phentsize, eh->e_phnum
+    };
     result = 0;
 done:
     if (result && mapping != MAP_FAILED) munmap(mapping, reservation);
