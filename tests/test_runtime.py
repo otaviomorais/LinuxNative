@@ -601,6 +601,43 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(res2.returncode, 33, res2.stderr.decode(errors="replace"))
         self.assertIn(b"AOT cache hit:", res2.stderr)
 
+    def test_x86_full_cli_app_with_args_and_file_inspection(self):
+        c_src = PROJECT / "examples" / "real_app_x86.c"
+        if not c_src.exists():
+            self.skipTest("real_app_x86.c not found")
+
+        x86_elf = self.directory / "real_cli_x86.elf"
+        res_cc = subprocess.run([
+            "clang", "--target=x86_64-linux-gnu", "-O2", "-mno-red-zone",
+            "-ffreestanding", "-fno-builtin", "-nostdlib", "-static",
+            str(c_src), "-o", str(x86_elf)
+        ], capture_output=True)
+        if res_cc.returncode != 0:
+            self.skipTest("clang x86_64 target compilation unavailable")
+
+        # Test math calculation via CLI arguments
+        res_calc = subprocess.run([
+            str(RUNTIME), "--root", str(PROJECT), str(x86_elf), "--calc", "150", "+", "25"
+        ], capture_output=True)
+        self.assertEqual(res_calc.returncode, 0, res_calc.stderr.decode(errors="replace"))
+        self.assertIn(b"150 + 25 = 175", res_calc.stdout)
+
+        # Test division and remainder via CLI arguments
+        res_div = subprocess.run([
+            str(RUNTIME), "--root", str(PROJECT), str(x86_elf), "--calc", "200", "/", "8"
+        ], capture_output=True)
+        self.assertEqual(res_div.returncode, 0, res_div.stderr.decode(errors="replace"))
+        self.assertIn(b"200 / 8 = 25", res_div.stdout)
+
+        # Test file inspection
+        res_file = subprocess.run([
+            str(RUNTIME), "--root", str(PROJECT), str(x86_elf), "--file", "README.md"
+        ], capture_output=True)
+        self.assertEqual(res_file.returncode, 0, res_file.stderr.decode(errors="replace"))
+        self.assertIn(b"Lines: 165", res_file.stdout)
+        self.assertIn(b"Words: 1067", res_file.stdout)
+        self.assertIn(b"Program finished with exit code 0", res_file.stdout)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
