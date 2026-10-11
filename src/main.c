@@ -106,10 +106,39 @@ int main(int argc, char **argv)
     size_t page = (size_t)sysconf(_SC_PAGESIZE);
     size_t stack_size = 1024 * 1024;
     size_t guest_argc = (size_t)argc - 3;
+
+    /* Setup standard guest environment variables */
+    char env_user[128], env_home[PATH_MAX], env_term[128];
+    const char *u = getenv("USER");
+    snprintf(env_user, sizeof(env_user), "USER=%s", u ? u : "root");
+    const char *h = getenv("HOME");
+    snprintf(env_home, sizeof(env_home), "HOME=%s", h ? h : "/root");
+    const char *t = getenv("TERM");
+    snprintf(env_term, sizeof(env_term), "TERM=%s", t ? t : "xterm-256color");
+
+    const char *guest_env[] = {
+        "PATH=/bin:/usr/bin:/sbin:/usr/sbin",
+        "SHELL=/bin/bash",
+        env_term,
+        "LANG=C.UTF-8",
+        "PS1=\\[\\033[01;32m\\]\\u@debian\\[\\033[00m\\]:\\[\\033[01;34m\\]\\w\\[\\033[00m\\]\\$ ",
+        env_user,
+        env_home
+    };
+    size_t guest_envc = sizeof(guest_env) / sizeof(guest_env[0]);
+
     /* Reserve at least half of the stack for execution, including the gateway. */
-    size_t argument_size = (guest_argc + 40) * sizeof(uint64_t) + 31;
+    size_t argument_size = (guest_argc + guest_envc + 40) * sizeof(uint64_t) + 31;
     for (size_t i = 0; i < guest_argc; ++i) {
         size_t length = strlen(argv[3 + i]) + 1;
+        if (argument_size > stack_size / 2 || length > stack_size / 2 - argument_size) {
+            fprintf(stderr, "lnative: guest arguments exceed stack budget\n");
+            return 1;
+        }
+        argument_size += length;
+    }
+    for (size_t i = 0; i < guest_envc; ++i) {
+        size_t length = strlen(guest_env[i]) + 1;
         if (argument_size > stack_size / 2 || length > stack_size / 2 - argument_size) {
             fprintf(stderr, "lnative: guest arguments exceed stack budget\n");
             return 1;
@@ -154,9 +183,18 @@ int main(int argc, char **argv)
         { AT_NULL, 0 }
     };
     size_t num_aux = sizeof(aux_entries) / sizeof(aux_entries[0]);
-    size_t words = 1 + guest_argc + 1 + 1 + num_aux * 2;
+    size_t words = 1 + guest_argc + 1 + guest_envc + 1 + num_aux * 2;
     uint64_t *initial = calloc(words, sizeof(*initial));
     if (!initial) { perror("lnative: arguments"); return 1; }
+
+    uint64_t env_ptrs[16];
+    for (size_t i = 0; i < guest_envc; ++i) {
+        size_t length = strlen(guest_env[i]) + 1;
+        top -= length;
+        memcpy((void *)top, guest_env[i], length);
+        env_ptrs[i] = top;
+    }
+
     initial[0] = guest_argc;
     for (size_t i = 0; i < guest_argc; ++i) {
         size_t length = strlen(argv[3 + i]) + 1;
@@ -165,10 +203,13 @@ int main(int argc, char **argv)
         initial[i + 1] = top;
     }
     initial[1 + guest_argc] = 0;
-    initial[2 + guest_argc] = 0;
+    for (size_t i = 0; i < guest_envc; ++i) {
+        initial[2 + guest_argc + i] = env_ptrs[i];
+    }
+    initial[2 + guest_argc + guest_envc] = 0;
     for (size_t i = 0; i < num_aux; ++i) {
-        initial[3 + guest_argc + 2 * i] = aux_entries[i].type;
-        initial[3 + guest_argc + 2 * i + 1] = aux_entries[i].val;
+        initial[3 + guest_argc + guest_envc + 2 * i] = aux_entries[i].type;
+        initial[3 + guest_argc + guest_envc + 2 * i + 1] = aux_entries[i].val;
     }
     top = (top - words * sizeof(*initial)) & ~(uintptr_t)15;
     memcpy((void *)top, initial, words * sizeof(*initial));

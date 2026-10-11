@@ -1,0 +1,24 @@
+#!/bin/sh
+# Launcher para entrar no terminal Debian interativo via LinuxNative
+set -e
+
+DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT_DIR="${LN_ROOT:-/data/data/com.termux/files/usr/glibc}"
+
+if [ ! -f "$DIR/build/lnative" ]; then
+    echo "Compilando LinuxNative..."
+    clang -O2 -g -std=c11 -Wall -Wextra -Werror -fno-strict-aliasing \
+        "$DIR/src/main.c" "$DIR/src/elf.c" "$DIR/src/runtime.c" "$DIR/src/gateway.S" \
+        -o "$DIR/build/lnative"
+fi
+
+if [ $# -eq 0 ]; then
+    echo "=================================================="
+    echo " Entrando no terminal Debian GNU/Linux (aarch64)  "
+    echo " Sem root, sem ptrace, via LinuxNative runtime!   "
+    echo " Digite 'exit' para sair.                         "
+    echo "=================================================="
+    exec "$DIR/build/lnative" --root "$ROOT_DIR" /bin/bash -i
+else
+    exec "$DIR/build/lnative" --root "$ROOT_DIR" /bin/bash "$@"
+fi
