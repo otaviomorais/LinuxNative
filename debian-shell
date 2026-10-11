@@ -4,7 +4,15 @@ set -e
 
 SCRIPT="$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")"
 DIR="$(cd "$(dirname "$SCRIPT")" && pwd)"
-ROOT_DIR="${LN_ROOT:-/data/data/com.termux/files/usr/glibc}"
+if [ -z "$LN_ROOT" ]; then
+    if [ -d "/data/data/com.termux/files/home/debian-rootfs" ]; then
+        ROOT_DIR="/data/data/com.termux/files/home/debian-rootfs"
+    else
+        ROOT_DIR="/data/data/com.termux/files/usr/glibc"
+    fi
+else
+    ROOT_DIR="$LN_ROOT"
+fi
 
 if [ ! -f "$DIR/build/lnative" ]; then
     echo "Compilando LinuxNative..."

@@ -4,6 +4,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <setjmp.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -13,9 +14,11 @@
 #include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/sysinfo.h>
 #include <sys/time.h>
 #include <sys/uio.h>
 #include <sys/utsname.h>
+#include <sys/wait.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -112,6 +115,9 @@ static long guest_open(const uint64_t *r)
     int fd = openat(root_fd, rel_path, (int)r[2], (mode_t)r[3]);
     if (fd < 0 && errno == ENOENT && (!strncmp(path, "/dev/", 5) || !strncmp(path, "/proc/", 6))) {
         fd = open(path, (int)r[2], (mode_t)r[3]);
+    }
+    if (trace_calls) {
+        fprintf(stderr, "lnative: open '%s' (rel '%s') -> %d\n", path, rel_path, fd);
     }
     return fd < 0 ? -errno : fd;
 }
@@ -256,6 +262,179 @@ static long guest_uname(const uint64_t *r)
     return 0;
 }
 
+static long guest_statx(const uint64_t *r)
+{
+    int dirfd = (int)r[0];
+    const char *path = (const char *)(uintptr_t)r[1];
+    int flags = (int)r[2];
+    unsigned int mask = (unsigned int)r[3];
+    void *statxbuf = (void *)(uintptr_t)r[4];
+
+    if (!path || !*path) {
+        long res = syscall(SYS_statx, dirfd, "", flags, mask, statxbuf);
+        return res < 0 ? -errno : res;
+    }
+
+    if (!strncmp(path, "/dev/", 5) || !strncmp(path, "/proc/", 6) || !strncmp(path, "/sys/", 6)) {
+        long res = syscall(SYS_statx, AT_FDCWD, path, flags, mask, statxbuf);
+        if (res >= 0 || errno != ENOENT)
+            return res < 0 ? -errno : res;
+    }
+
+    const char *rel_path = NULL;
+    long err = guest_resolve_path(path, &rel_path);
+    if (err) return err;
+
+    long res = syscall(SYS_statx, root_fd, rel_path, flags, mask, statxbuf);
+    if (res < 0 && errno == ENOENT && (!strncmp(path, "/dev/", 5) || !strncmp(path, "/proc/", 6) || !strncmp(path, "/sys/", 6))) {
+        res = syscall(SYS_statx, AT_FDCWD, path, flags, mask, statxbuf);
+    }
+    return res < 0 ? -errno : res;
+}
+
+static long guest_pipe2(const uint64_t *r)
+{
+    int *pipefd = (int *)(uintptr_t)r[0];
+    int flags = (int)r[1];
+    if (pipe2(pipefd, flags))
+        return -errno;
+    return 0;
+}
+
+static long guest_dup(const uint64_t *r)
+{
+    int res = dup((int)r[0]);
+    return res < 0 ? -errno : res;
+}
+
+static long guest_dup3(const uint64_t *r)
+{
+    int res = dup3((int)r[0], (int)r[1], (int)r[2]);
+    return res < 0 ? -errno : res;
+}
+
+static long guest_futex(const uint64_t *r)
+{
+    long res = syscall(SYS_futex, (void *)(uintptr_t)r[0], (int)r[1], (uint32_t)r[2],
+                       (const struct timespec *)(uintptr_t)r[3], (void *)(uintptr_t)r[4], (uint32_t)r[5]);
+    return res < 0 ? -errno : res;
+}
+
+static long guest_prctl(const uint64_t *r)
+{
+    long res = syscall(SYS_prctl, (int)r[0], (unsigned long)r[1], (unsigned long)r[2],
+                       (unsigned long)r[3], (unsigned long)r[4]);
+    return res < 0 ? -errno : res;
+}
+
+static long guest_sysinfo(const uint64_t *r)
+{
+    long res = syscall(SYS_sysinfo, (void *)(uintptr_t)r[0]);
+    return res < 0 ? -errno : res;
+}
+
+static long guest_gettimeofday(const uint64_t *r)
+{
+    long res = gettimeofday((struct timeval *)(uintptr_t)r[0], (struct timezone *)(uintptr_t)r[1]);
+    return res < 0 ? -errno : res;
+}
+
+static long guest_wait4(const uint64_t *r)
+{
+    long res = wait4((pid_t)(int64_t)r[0], (int *)(uintptr_t)r[1], (int)r[2], (struct rusage *)(uintptr_t)r[3]);
+    return res < 0 ? -errno : res;
+}
+
+static long guest_tgkill(const uint64_t *r)
+{
+    long res = syscall(SYS_tgkill, (pid_t)(int64_t)r[0], (pid_t)(int64_t)r[1], (int)r[2]);
+    return res < 0 ? -errno : res;
+}
+
+static long guest_chdir(const uint64_t *r)
+{
+    const char *path = (const char *)(uintptr_t)r[0];
+    if (!path) return -EFAULT;
+    const char *rel_path = NULL;
+    long err = guest_resolve_path(path, &rel_path);
+    if (err) return err;
+
+    char full_host_path[PATH_MAX];
+    int n = snprintf(full_host_path, sizeof(full_host_path), "%s/%s", root_prefix, rel_path);
+    if (n < 0 || (size_t)n >= sizeof(full_host_path)) return -ENAMETOOLONG;
+
+    if (chdir(full_host_path))
+        return -errno;
+    return 0;
+}
+
+static long guest_getcwd(const uint64_t *r)
+{
+    char *buf = (char *)(uintptr_t)r[0];
+    size_t size = (size_t)r[1];
+    if (!buf || !size) return -EINVAL;
+
+    char host_cwd[PATH_MAX];
+    if (!getcwd(host_cwd, sizeof(host_cwd)))
+        return -errno;
+
+    const char *guest_path = "/";
+    if (strncmp(host_cwd, root_prefix, root_prefix_len) == 0) {
+        guest_path = host_cwd + root_prefix_len;
+        if (*guest_path == '\0') guest_path = "/";
+    }
+    size_t len = strlen(guest_path) + 1;
+    if (len > size) return -ERANGE;
+    memcpy(buf, guest_path, len);
+    return (long)len;
+}
+
+static long guest_clone(const uint64_t *r)
+{
+    unsigned long flags = (unsigned long)r[0];
+    void *child_stack = (void *)(uintptr_t)r[1];
+    int *ptid = (int *)(uintptr_t)r[2];
+    unsigned long tls = (unsigned long)r[3];
+    int *ctid = (int *)(uintptr_t)r[4];
+
+    long res = syscall(SYS_clone, flags, child_stack, ptid, tls, ctid);
+    return res < 0 ? -errno : res;
+}
+
+static long guest_execve(const uint64_t *r)
+{
+    const char *filename = (const char *)(uintptr_t)r[0];
+    char *const *argv = (char *const *)(uintptr_t)r[1];
+    char *const *envp = (char *const *)(uintptr_t)r[2];
+
+    if (!filename) return -EFAULT;
+
+    size_t argc = 0;
+    if (argv) {
+        while (argv[argc]) argc++;
+    }
+
+    char self_path[PATH_MAX];
+    ssize_t s = readlink("/proc/self/exe", self_path, sizeof(self_path) - 1);
+    if (s <= 0) return -errno;
+    self_path[s] = '\0';
+
+    char **new_argv = malloc((argc + 4) * sizeof(char *));
+    if (!new_argv) return -ENOMEM;
+    new_argv[0] = self_path;
+    new_argv[1] = "--root";
+    new_argv[2] = root_prefix;
+    new_argv[3] = (char *)filename;
+    for (size_t i = 1; i < argc; ++i) {
+        new_argv[3 + i] = argv[i];
+    }
+    new_argv[3 + (argc > 0 ? argc : 1)] = NULL;
+
+    execve(self_path, new_argv, envp);
+    free(new_argv);
+    return -errno;
+}
+
 static long guest_brk(const uint64_t *r)
 {
     uintptr_t req = (uintptr_t)r[0];
@@ -277,6 +456,129 @@ static long guest_brk(const uint64_t *r)
     }
     guest_brk_current = req;
     return (long)guest_brk_current;
+}
+
+static int branch_offset(uintptr_t from, uintptr_t to, uint32_t *word)
+{
+    int64_t delta = (int64_t)to - (int64_t)from;
+    if ((delta & 3) || delta < -(1LL << 27) || delta >= (1LL << 27))
+        return -1;
+    *word = 0x14000000u | ((uint32_t)(delta / 4) & 0x03ffffffu);
+    return 0;
+}
+
+static sigjmp_buf g_patch_jmp;
+static volatile sig_atomic_t g_patch_handling = 0;
+
+static void patch_sig_handler(int sig, siginfo_t *info, void *ucontext)
+{
+    (void)sig; (void)info; (void)ucontext;
+    if (g_patch_handling) {
+        siglongjmp(g_patch_jmp, 1);
+    }
+    _exit(128 + sig);
+}
+
+static void *alloc_stub_near(uintptr_t near_addr, size_t size)
+{
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    size = (size + page - 1) & ~(page - 1);
+
+    for (size_t step = 0x10000; step <= 64 * 1024 * 1024; step += 0x10000) {
+        if (near_addr > step + 0x10000000) {
+            uintptr_t try_addr = (near_addr - step) & ~(page - 1);
+            void *p = mmap((void *)try_addr, size, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+            if (p != MAP_FAILED) return p;
+        }
+        uintptr_t try_addr = (near_addr + step) & ~(page - 1);
+        void *p = mmap((void *)try_addr, size, PROT_READ | PROT_WRITE,
+                       MAP_PRIVATE | MAP_ANONYMOUS | MAP_FIXED_NOREPLACE, -1, 0);
+        if (p != MAP_FAILED) return p;
+    }
+    return NULL;
+}
+
+static void patch_executable_region(void *addr, size_t length)
+{
+    if (!addr || !length) return;
+    size_t page = (size_t)sysconf(_SC_PAGESIZE);
+    uintptr_t start = (uintptr_t)addr;
+    uintptr_t end = start + length;
+
+    size_t count = 0;
+    const uint32_t *ptr = (const uint32_t *)start;
+    size_t num_words = length / 4;
+
+    struct sigaction sa, old_bus, old_segv;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = patch_sig_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGBUS, &sa, &old_bus);
+    sigaction(SIGSEGV, &sa, &old_segv);
+
+    g_patch_handling = 1;
+    if (sigsetjmp(g_patch_jmp, 1) == 0) {
+        for (size_t i = 0; i < num_words; ++i) {
+            if (ptr[i] == 0xd4000001u) {
+                count++;
+            }
+        }
+    }
+    g_patch_handling = 0;
+    sigaction(SIGBUS, &old_bus, NULL);
+    sigaction(SIGSEGV, &old_segv, NULL);
+
+    if (!count) return;
+
+    size_t stub_bytes = (count * 48 + page - 1) & ~(page - 1);
+    void *stub_base = alloc_stub_near(start, stub_bytes);
+    if (!stub_base) return;
+
+    uintptr_t page_start = start & ~(page - 1);
+    size_t page_len = ((start + length + page - 1) & ~(page - 1)) - page_start;
+
+    if (mprotect((void *)page_start, page_len, PROT_READ | PROT_WRITE)) {
+        munmap(stub_base, stub_bytes);
+        return;
+    }
+
+    uint32_t *write_ptr = (uint32_t *)start;
+    size_t stub_idx = 0;
+    for (size_t i = 0; i < num_words && stub_idx < count; ++i) {
+        if (write_ptr[i] == 0xd4000001u) {
+            uintptr_t site = start + i * 4;
+            uintptr_t stub = (uintptr_t)stub_base + stub_idx * 48;
+            uint32_t words[12] = {
+                0xa9be47f0, /* stp x16,x17,[sp,#-32]! */
+                0xf9000bfe, /* str x30,[sp,#16] */
+                0x580000d0, /* ldr x16, literal at +32 */
+                0xd63f0200, /* blr x16 */
+                0xf9400bfe, /* ldr x30,[sp,#16] */
+                0xa8c247f0, /* ldp x16,x17,[sp],#32 */
+                0, 0xd503201f, 0, 0, 0xd503201f, 0xd503201f
+            };
+            uint32_t jump;
+            if (branch_offset(site, stub, &jump) == 0 &&
+                branch_offset(stub + 24, site + 4, &words[6]) == 0) {
+                uint64_t target = (uintptr_t)ln_gateway;
+                memcpy(&words[8], &target, sizeof(target));
+                memcpy((void *)stub, words, sizeof(words));
+                write_ptr[i] = jump;
+                stub_idx++;
+            }
+        }
+    }
+
+    __builtin___clear_cache((char *)start, (char *)start + length);
+    __builtin___clear_cache((char *)stub_base, (char *)stub_base + stub_bytes);
+    mprotect((void *)page_start, page_len, PROT_READ | PROT_EXEC);
+    mprotect(stub_base, stub_bytes, PROT_READ | PROT_EXEC);
+
+    if (trace_calls) {
+        fprintf(stderr, "lnative: runtime patched %zu SVC sites in [%p, %p]\n",
+                stub_idx, addr, (void *)end);
+    }
 }
 
 static long guest_mmap(const uint64_t *r)
@@ -306,9 +608,31 @@ static long guest_mmap(const uint64_t *r)
         offset = 0;
     }
 
+    if (trace_calls) {
+        fprintf(stderr, "lnative: mmap addr=%p len=%zu prot=0x%x flags=0x%x fd=%d off=%ld\n",
+                addr, length, prot, flags, fd, (long)offset);
+    }
+
     void *result = mmap(addr, length, prot, flags, fd, offset);
     if (result == MAP_FAILED)
         return -errno;
+
+    if (prot & PROT_EXEC) {
+        size_t scan_len = length;
+        if (fd >= 0) {
+            struct stat st;
+            if (fstat(fd, &st) == 0 && S_ISREG(st.st_mode)) {
+                if (offset >= st.st_size) {
+                    scan_len = 0;
+                } else if ((off_t)(offset + length) > st.st_size) {
+                    scan_len = (size_t)(st.st_size - offset);
+                }
+            }
+        }
+        if (scan_len > 0) {
+            patch_executable_region(result, scan_len);
+        }
+    }
 
     return (long)(uintptr_t)result;
 }
@@ -343,6 +667,10 @@ static long guest_mprotect(const uint64_t *r)
 
     if (mprotect(addr, length, prot))
         return -errno;
+
+    if (prot & PROT_EXEC) {
+        patch_executable_region(addr, length);
+    }
 
     return 0;
 }
@@ -490,14 +818,29 @@ uint64_t ln_dispatch(uint64_t *r)
 {
     long result;
     switch (r[8]) {
+    case LN_GETCWD:
+        result = guest_getcwd(r);
+        break;
+    case LN_DUP:
+        result = guest_dup(r);
+        break;
+    case LN_DUP3:
+        result = guest_dup3(r);
+        break;
     case LN_FCNTL:
         result = guest_fcntl(r);
         break;
     case LN_IOCTL:
         result = guest_ioctl(r);
         break;
+    case LN_CHDIR:
+        result = guest_chdir(r);
+        break;
     case LN_FACCESSAT:
         result = guest_faccessat(r);
+        break;
+    case LN_PIPE2:
+        result = guest_pipe2(r);
         break;
     case LN_READV:
         result = guest_readv(r);
@@ -514,6 +857,9 @@ uint64_t ln_dispatch(uint64_t *r)
     case LN_SET_TID_ADDRESS:
         result = getpid();
         break;
+    case LN_FUTEX:
+        result = guest_futex(r);
+        break;
     case LN_SET_ROBUST_LIST:
         result = 0;
         break;
@@ -523,14 +869,42 @@ uint64_t ln_dispatch(uint64_t *r)
     case LN_CLOCK_GETTIME:
         result = guest_clock_gettime(r);
         break;
+    case LN_TGKILL:
+        result = guest_tgkill(r);
+        break;
     case LN_RT_SIGACTION:
         result = guest_rt_sigaction(r);
         break;
     case LN_RT_SIGPROCMASK:
         result = guest_rt_sigprocmask(r);
         break;
+    case LN_SETPGID:
+        result = setpgid((pid_t)(int64_t)r[0], (pid_t)(int64_t)r[1]);
+        if (result < 0) result = -errno;
+        break;
+    case LN_GETPGID:
+        result = getpgid((pid_t)(int64_t)r[0]);
+        if (result < 0) result = -errno;
+        break;
+    case LN_SETSID:
+        result = setsid();
+        if (result < 0) result = -errno;
+        break;
+    case LN_GETSID:
+        result = getsid((pid_t)(int64_t)r[0]);
+        if (result < 0) result = -errno;
+        break;
     case LN_UNAME:
         result = guest_uname(r);
+        break;
+    case LN_UMASK:
+        result = umask((mode_t)r[0]);
+        break;
+    case LN_PRCTL:
+        result = guest_prctl(r);
+        break;
+    case LN_GETTIMEOFDAY:
+        result = guest_gettimeofday(r);
         break;
     case LN_GETPID:
         result = getpid();
@@ -552,6 +926,24 @@ uint64_t ln_dispatch(uint64_t *r)
         break;
     case LN_GETTID:
         result = syscall(SYS_gettid);
+        break;
+    case LN_SYSINFO:
+        result = guest_sysinfo(r);
+        break;
+    case LN_CLONE:
+        result = guest_clone(r);
+        break;
+    case LN_EXECVE:
+        result = guest_execve(r);
+        break;
+    case LN_WAIT4:
+        result = guest_wait4(r);
+        break;
+    case LN_STATX:
+        result = guest_statx(r);
+        break;
+    case LN_RSEQ:
+        result = -ENOSYS;
         break;
     case LN_GETDENTS64:
         result = guest_getdents64(r);

@@ -2,11 +2,13 @@
 #include "lnative.h"
 #include <errno.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/auxv.h>
 #include <sys/mman.h>
+#include <ucontext.h>
 #include <unistd.h>
 
 static int resolve_binary(const char *root, const char *arg, char *out, size_t out_sz)
@@ -56,8 +58,23 @@ static int resolve_interp(const char *root, const char *interp, char *out, size_
     return -1;
 }
 
+static void crash_handler(int sig, siginfo_t *info, void *uctx)
+{
+    ucontext_t *uc = (ucontext_t *)uctx;
+    fprintf(stderr, "lnative: CRASH signal %d at addr %p, pc=%p\n",
+            sig, info->si_addr, (void *)uc->uc_mcontext.pc);
+    _exit(128 + sig);
+}
+
 int main(int argc, char **argv)
 {
+    struct sigaction sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_sigaction = crash_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sigaction(SIGSEGV, &sa, NULL);
+    sigaction(SIGBUS, &sa, NULL);
+    sigaction(SIGILL, &sa, NULL);
 
     int verbose = 0;
     if (argc > 1 && !strcmp(argv[1], "--verbose")) {
@@ -102,6 +119,8 @@ int main(int argc, char **argv)
         if (interp_top > max_top)
             max_top = interp_top;
     }
+    if (verbose)
+        fprintf(stderr, "lnative: target base=%p, interp base=%p\n", image.base, interp_image.base);
     ln_runtime_set_bounds((uintptr_t)image.base, max_top - (uintptr_t)image.base);
     size_t page = (size_t)sysconf(_SC_PAGESIZE);
     size_t stack_size = 1024 * 1024;
