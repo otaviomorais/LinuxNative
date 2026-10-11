@@ -15,25 +15,28 @@ import argparse
 REG_MAP = {
     # 64-bit
     'rax': 'x19', 'rbx': 'x20', 'rcx': 'x21', 'rdx': 'x22',
-    'rsi': 'x23', 'rdi': 'x24', 'rbp': 'x25', 'rsp': 'sp',
-    'r8': 'x8',   'r9': 'x9',   'r10': 'x10', 'r11': 'x11',
+    'rsi': 'x23', 'rdi': 'x24', 'rbp': 'x25', 'rsp': 'x28',
+    'r8': 'x26',  'r9': 'x27',  'r10': 'x10', 'r11': 'x11',
     'r12': 'x12', 'r13': 'x13', 'r14': 'x14', 'r15': 'x15',
 
     # 32-bit
     'eax': 'w19', 'ebx': 'w20', 'ecx': 'w21', 'edx': 'w22',
-    'esi': 'w23', 'edi': 'w24', 'ebp': 'w25', 'esp': 'wsp',
-    'r8d': 'w8',  'r9d': 'w9',  'r10d': 'w10', 'r11d': 'w11',
+    'esi': 'w23', 'edi': 'w24', 'ebp': 'w25', 'esp': 'w28',
+    'r8d': 'w26', 'r9d': 'w27', 'r10d': 'w10', 'r11d': 'w11',
     'r12d': 'w12','r13d': 'w13','r14d': 'w14', 'r15d': 'w15',
 
     # 16-bit
     'ax': 'w19',  'bx': 'w20',  'cx': 'w21',  'dx': 'w22',
-    'si': 'w23',  'di': 'w24',  'bp': 'w25',
+    'si': 'w23',  'di': 'w24',  'bp': 'w25',  'sp': 'w28',
+    'r8w': 'w26', 'r9w': 'w27', 'r10w': 'w10','r11w': 'w11',
+    'r12w': 'w12','r13w': 'w13','r14w': 'w14','r15w': 'w15',
 
     # 8-bit
     'al': 'w19',  'bl': 'w20',  'cl': 'w21',  'dl': 'w22',
-    'sil': 'w23', 'dil': 'w24', 'bpl': 'w25',
-    'r8b': 'w8',  'r9b': 'w9',  'r10b': 'w10', 'r11b': 'w11',
-    'r12b': 'w12','r13b': 'w13','r14b': 'w14', 'r15b': 'w15',
+    'sil': 'w23', 'dil': 'w24', 'bpl': 'w25', 'spl': 'w28',
+    'r8b': 'w26', 'r9b': 'w27', 'r10b': 'w10','r11b': 'w11',
+    'r12b': 'w12','r13b': 'w13','r14b': 'w14','r15b': 'w15',
+    'ah': 'w19',  'bh': 'w20',  'ch': 'w21',  'dh': 'w22',
 }
 
 SYSCALL_MAP = {
@@ -139,27 +142,166 @@ def to_w_reg(r):
         return 'w' + r[1:]
     return r
 
-def parse_mem(mem_str):
+def to_x_reg(r):
+    if r.startswith('w'):
+        return 'x' + r[1:]
+    return r
+
+def parse_x86_mem(mem_str, rip_target=None):
     size = 'qword'
     lower = mem_str.lower()
-    if 'byte ptr' in lower:
-        size = 'byte'
-    elif 'word ptr' in lower:
-        size = 'word'
-    elif 'dword ptr' in lower:
-        size = 'dword'
-    elif 'qword ptr' in lower:
-        size = 'qword'
+    if 'byte ptr' in lower: size = 'byte'
+    elif 'dword ptr' in lower: size = 'dword'
+    elif 'qword ptr' in lower: size = 'qword'
+    elif 'word ptr' in lower: size = 'word'
 
     inner = mem_str[mem_str.index('[')+1 : mem_str.index(']')].strip()
-    m = re.match(r'^([a-zA-Z0-9]+)\s*([+-])\s*([0-9a-fA-Fx]+)$', inner)
-    if m:
-        base, sign, off_str = m.groups()
-        off = int(off_str, 16) if off_str.startswith('0x') else int(off_str)
-        if sign == '-': off = -off
-        return size, map_reg(base), off
+    
+    if 'rip' in inner.lower() and rip_target is not None:
+        return {'type': 'rip', 'size': size, 'target': f"data_{rip_target:x}"}
+
+    clean = re.sub(r'\s*-\s*', '+-', inner)
+    terms = [t.strip() for t in clean.split('+') if t.strip()]
+    base_reg = None
+    idx_reg = None
+    scale = 0
+    imm_offset = 0
+
+    for t in terms:
+        if '*' in t:
+            p = t.split('*')
+            if p[0].isdigit():
+                scale = int(p[0])
+                idx_reg = to_x_reg(map_reg(p[1]))
+            else:
+                scale = int(p[1])
+                idx_reg = to_x_reg(map_reg(p[0]))
+        elif re.match(r'^[+-]?(?:0x[0-9a-fA-F]+|[0-9]+)$', t):
+            imm_offset += int(t, 16) if '0x' in t.lower() else int(t)
+        else:
+            r = to_x_reg(map_reg(t))
+            if base_reg is None:
+                base_reg = r
+            elif idx_reg is None:
+                idx_reg = r
+                scale = 1
+
+    return {
+        'type': 'mem',
+        'size': size,
+        'base': base_reg or 'x28',
+        'index': idx_reg,
+        'scale': scale,
+        'offset': imm_offset
+    }
+
+def emit_load(dst_reg, mem_info):
+    size = mem_info['size']
+    inst = 'ldrb' if size == 'byte' else ('ldrh' if size == 'word' else ('ldr' if size == 'dword' else 'ldr'))
+    target_reg = to_w_reg(dst_reg) if size in ('byte', 'word', 'dword') else dst_reg
+
+    if mem_info['type'] == 'rip':
+        return [f"    ldr x16, ={mem_info['target']}",
+                f"    {inst} {target_reg}, [x16]"]
+
+    base = mem_info['base']
+    idx = mem_info['index']
+    scale = mem_info['scale']
+    off = mem_info['offset']
+
+    if not idx and -256 <= off <= 255:
+        return [f"    {inst} {target_reg}, [{base}, #{off}]"]
+
+    lines = []
+    if idx:
+        shift = {1: 0, 2: 1, 4: 2, 8: 3}.get(scale, 0)
+        shift_str = f", lsl #{shift}" if shift > 0 else ""
+        lines.append(f"    add x17, {base}, {idx}{shift_str}")
+        if -256 <= off <= 255:
+            lines.append(f"    {inst} {target_reg}, [x17, #{off}]")
+        else:
+            lines.append(f"    mov x16, #{off}")
+            lines.append(f"    add x17, x17, x16")
+            lines.append(f"    {inst} {target_reg}, [x17]")
     else:
-        return size, map_reg(inner), 0
+        lines.append(f"    mov x16, #{off}")
+        lines.append(f"    add x17, {base}, x16")
+        lines.append(f"    {inst} {target_reg}, [x17]")
+    return lines
+
+def emit_store(src_reg_or_imm, mem_info):
+    size = mem_info['size']
+    inst = 'strb' if size == 'byte' else ('strh' if size == 'word' else ('str' if size == 'dword' else 'str'))
+
+    lines = []
+    if src_reg_or_imm.startswith('#'):
+        imm_val = src_reg_or_imm[1:]
+        lines.append(f"    mov w16, #{imm_val}")
+        val_reg = 'w16' if size in ('byte', 'word', 'dword') else 'x16'
+    else:
+        val_reg = to_w_reg(src_reg_or_imm) if size in ('byte', 'word', 'dword') else src_reg_or_imm
+
+    if mem_info['type'] == 'rip':
+        lines.append(f"    ldr x17, ={mem_info['target']}")
+        lines.append(f"    {inst} {val_reg}, [x17]")
+        return lines
+
+    base = mem_info['base']
+    idx = mem_info['index']
+    scale = mem_info['scale']
+    off = mem_info['offset']
+
+    scratch_off = 'x7' if src_reg_or_imm.startswith('#') else 'x16'
+
+    if not idx and -256 <= off <= 255:
+        lines.append(f"    {inst} {val_reg}, [{base}, #{off}]")
+        return lines
+
+    if idx:
+        shift = {1: 0, 2: 1, 4: 2, 8: 3}.get(scale, 0)
+        shift_str = f", lsl #{shift}" if shift > 0 else ""
+        lines.append(f"    add x17, {base}, {idx}{shift_str}")
+        if -256 <= off <= 255:
+            lines.append(f"    {inst} {val_reg}, [x17, #{off}]")
+        else:
+            lines.append(f"    mov {scratch_off}, #{off}")
+            lines.append(f"    add x17, x17, {scratch_off}")
+            lines.append(f"    {inst} {val_reg}, [x17]")
+    else:
+        lines.append(f"    mov {scratch_off}, #{off}")
+        lines.append(f"    add x17, {base}, {scratch_off}")
+        lines.append(f"    {inst} {val_reg}, [x17]")
+    return lines
+
+def emit_lea(dst_reg, mem_info):
+    if mem_info['type'] == 'rip':
+        return [f"    ldr {dst_reg}, ={mem_info['target']}"]
+    base = mem_info['base']
+    idx = mem_info['index']
+    scale = mem_info['scale']
+    off = mem_info['offset']
+    lines = []
+    x_dst = to_x_reg(dst_reg)
+
+    if not idx:
+        if off == 0:
+            lines.append(f"    mov {x_dst}, {base}")
+        elif off > 0:
+            lines.append(f"    add {x_dst}, {base}, #{off}")
+        else:
+            lines.append(f"    sub {x_dst}, {base}, #{-off}")
+    else:
+        shift = {1: 0, 2: 1, 4: 2, 8: 3}.get(scale, 0)
+        shift_str = f", lsl #{shift}" if shift > 0 else ""
+        lines.append(f"    add {x_dst}, {base}, {idx}{shift_str}")
+        if off > 0:
+            lines.append(f"    add {x_dst}, {x_dst}, #{off}")
+        elif off < 0:
+            lines.append(f"    sub {x_dst}, {x_dst}, #{-off}")
+
+    if dst_reg.startswith('w'):
+        lines.append(f"    uxtw {x_dst}, {dst_reg}")
+    return lines
 
 def map_operand(op, rip_target=None):
     op = op.strip()
@@ -198,8 +340,8 @@ def transpile(input_elf, output_asm):
     asm_out.append("    mov x1, x23  /* RSI */")
     asm_out.append("    mov x2, x22  /* RDX */")
     asm_out.append("    mov x3, x10  /* R10 */")
-    asm_out.append("    mov x4, x8   /* R8  */")
-    asm_out.append("    mov x5, x9   /* R9  */")
+    asm_out.append("    mov x4, x26  /* R8  */")
+    asm_out.append("    mov x5, x27  /* R9  */")
     asm_out.append("")
 
     for x86_nr, arm_nr in SYSCALL_MAP.items():
@@ -230,6 +372,7 @@ def transpile(input_elf, output_asm):
 
     # Entry point
     asm_out.append("_start:")
+    asm_out.append("    mov x28, sp")
     asm_out.append(f"    b loc_{e_entry:x}\n")
 
     # Collect all referenced data addresses
@@ -259,56 +402,103 @@ def transpile(input_elf, output_asm):
             asm_out.append("    bl x86_syscall_adapter")
         elif mnem == 'ret':
             asm_out.append("    ret")
-        elif mnem == 'mov':
+        elif mnem in ('mov', 'movabs'):
             dst_str = parts[0]
             src_str = parts[1]
             if '[' in dst_str: # store
-                size, base, off = parse_mem(dst_str)
+                mem_info = parse_x86_mem(dst_str, rip_target)
                 src = map_operand(src_str, rip_target)
-                if src.startswith('#'):
-                    asm_out.append(f"    mov w16, {src}")
-                    src_reg = 'w16' if size in ('byte', 'word', 'dword') else 'x16'
-                else:
-                    src_reg = to_w_reg(src) if size in ('byte', 'word', 'dword') else src
-                inst = 'strb' if size == 'byte' else ('strh' if size == 'word' else ('str' if size == 'dword' else 'str'))
-                asm_out.append(f"    {inst} {src_reg}, [{base}, #{off}]")
+                asm_out.extend(emit_store(src, mem_info))
             elif '[' in src_str: # load
-                if '[rip' in src_str and rip_target is not None:
-                    dst = map_reg(dst_str)
-                    asm_out.append(f"    ldr {dst}, =data_{rip_target:x}")
-                else:
-                    size, base, off = parse_mem(src_str)
-                    dst = map_reg(dst_str)
-                    if size in ('byte', 'word', 'dword'):
-                        dst = to_w_reg(dst)
-                    inst = 'ldrb' if size == 'byte' else ('ldrh' if size == 'word' else 'ldr')
-                    asm_out.append(f"    {inst} {dst}, [{base}, #{off}]")
+                mem_info = parse_x86_mem(src_str, rip_target)
+                dst = map_reg(dst_str)
+                asm_out.extend(emit_load(dst, mem_info))
             else: # reg-reg or reg-imm
                 dst = map_reg(dst_str)
                 src = map_operand(src_str, rip_target)
                 if src.startswith('='):
                     asm_out.append(f"    ldr {dst}, {src}")
-                elif src.startswith('#') and int(src[1:]) > 65535:
+                elif src.startswith('#') and (int(src[1:]) > 65535 or int(src[1:]) < -65535):
                     asm_out.append(f"    ldr {dst}, ={src[1:]}")
                 else:
                     asm_out.append(f"    mov {dst}, {src}")
+        elif mnem == 'movzx':
+            dst = map_reg(parts[0])
+            if '[' in parts[1]:
+                mem_info = parse_x86_mem(parts[1], rip_target)
+                asm_out.extend(emit_load(dst, mem_info))
+            else:
+                src = map_reg(parts[1])
+                asm_out.append(f"    uxtb {to_w_reg(dst)}, {to_w_reg(src)}")
         elif mnem == 'lea':
             dst = map_reg(parts[0])
-            if rip_target is not None:
-                asm_out.append(f"    ldr {dst}, =data_{rip_target:x}")
-            elif '[' in parts[1]:
-                size, base, off = parse_mem(parts[1])
-                asm_out.append(f"    add {dst}, {base}, #{off}")
-            else:
-                asm_out.append(f"    mov {dst}, {map_reg(parts[1])}")
+            mem_info = parse_x86_mem(parts[1], rip_target)
+            asm_out.extend(emit_lea(dst, mem_info))
         elif mnem == 'add':
             dst = map_reg(parts[0])
-            src = map_operand(parts[1])
-            asm_out.append(f"    add {dst}, {dst}, {src}")
+            if '[' in parts[1]:
+                mem_info = parse_x86_mem(parts[1], rip_target)
+                asm_out.extend(emit_load('x16', mem_info))
+                reg_src = 'w16' if dst.startswith('w') else 'x16'
+                asm_out.append(f"    add {dst}, {dst}, {reg_src}")
+            else:
+                src = map_operand(parts[1])
+                if src.startswith('#'):
+                    imm_val = int(src[1:])
+                    if imm_val < 0:
+                        asm_out.append(f"    sub {dst}, {dst}, #{-imm_val}")
+                    elif imm_val > 4095:
+                        scratch = 'w16' if dst.startswith('w') else 'x16'
+                        asm_out.append(f"    mov {scratch}, #{imm_val}")
+                        asm_out.append(f"    add {dst}, {dst}, {scratch}")
+                    else:
+                        asm_out.append(f"    add {dst}, {dst}, {src}")
+                else:
+                    if dst.startswith('w'):
+                        src = to_w_reg(src)
+                    elif dst.startswith('x'):
+                        src = to_x_reg(src)
+                    asm_out.append(f"    add {dst}, {dst}, {src}")
         elif mnem == 'sub':
             dst = map_reg(parts[0])
             src = map_operand(parts[1])
-            asm_out.append(f"    sub {dst}, {dst}, {src}")
+            if src.startswith('#'):
+                imm_val = int(src[1:])
+                if imm_val < 0:
+                    asm_out.append(f"    add {dst}, {dst}, #{-imm_val}")
+                elif imm_val > 4095:
+                    scratch = 'w16' if dst.startswith('w') else 'x16'
+                    asm_out.append(f"    mov {scratch}, #{imm_val}")
+                    asm_out.append(f"    sub {dst}, {dst}, {scratch}")
+                else:
+                    asm_out.append(f"    sub {dst}, {dst}, {src}")
+            else:
+                if dst.startswith('w'):
+                    src = to_w_reg(src)
+                elif dst.startswith('x'):
+                    src = to_x_reg(src)
+                asm_out.append(f"    sub {dst}, {dst}, {src}")
+        elif mnem == 'sbb':
+            dst = map_reg(parts[0])
+            src = map_operand(parts[1])
+            if src.startswith('#'):
+                imm_reg = 'w16' if dst.startswith('w') else 'x16'
+                asm_out.append(f"    mov {imm_reg}, {src}")
+                asm_out.append(f"    sbc {dst}, {dst}, {imm_reg}")
+            else:
+                if dst.startswith('w'):
+                    src = to_w_reg(src)
+                asm_out.append(f"    sbc {dst}, {dst}, {src}")
+        elif mnem == 'imul':
+            dst = map_reg(parts[0])
+            if len(parts) == 3:
+                src = map_reg(parts[1])
+                imm = map_operand(parts[2])
+                asm_out.append(f"    mov w16, {imm}")
+                asm_out.append(f"    mul {dst}, {src}, w16")
+            else:
+                src = map_operand(parts[1])
+                asm_out.append(f"    mul {dst}, {dst}, {src}")
         elif mnem == 'xor':
             dst = map_reg(parts[0])
             src = map_operand(parts[1])
@@ -324,10 +514,44 @@ def transpile(input_elf, output_asm):
             dst = map_reg(parts[0])
             src = map_operand(parts[1])
             asm_out.append(f"    orr {dst}, {dst}, {src}")
+        elif mnem == 'shr':
+            dst = map_reg(parts[0])
+            src = map_operand(parts[1])
+            if src.startswith('#'):
+                asm_out.append(f"    lsr {dst}, {dst}, {src}")
+            else:
+                asm_out.append(f"    lsr {dst}, {dst}, {src}")
+        elif mnem in ('shl', 'sal'):
+            dst = map_reg(parts[0])
+            src = map_operand(parts[1])
+            asm_out.append(f"    lsl {dst}, {dst}, {src}")
+        elif mnem == 'sar':
+            dst = map_reg(parts[0])
+            src = map_operand(parts[1])
+            asm_out.append(f"    asr {dst}, {dst}, {src}")
+        elif mnem == 'neg':
+            dst = map_reg(parts[0])
+            asm_out.append(f"    neg {dst}, {dst}")
+        elif mnem == 'not':
+            dst = map_reg(parts[0])
+            asm_out.append(f"    mvn {dst}, {dst}")
         elif mnem == 'cmp':
-            op1 = map_reg(parts[0])
-            op2 = map_operand(parts[1])
-            asm_out.append(f"    cmp {op1}, {op2}")
+            if '[' in parts[0]:
+                mem_info = parse_x86_mem(parts[0], rip_target)
+                asm_out.extend(emit_load('x16', mem_info))
+                op2 = map_operand(parts[1])
+                val2 = 'w16' if mem_info['size'] in ('byte', 'word', 'dword') else 'x16'
+                asm_out.append(f"    cmp {val2}, {op2}")
+            elif '[' in parts[1]:
+                op1 = map_reg(parts[0])
+                mem_info = parse_x86_mem(parts[1], rip_target)
+                asm_out.extend(emit_load('x16', mem_info))
+                val2 = 'w16' if mem_info['size'] in ('byte', 'word', 'dword') else 'x16'
+                asm_out.append(f"    cmp {op1}, {val2}")
+            else:
+                op1 = map_reg(parts[0])
+                op2 = map_operand(parts[1])
+                asm_out.append(f"    cmp {op1}, {op2}")
         elif mnem == 'test':
             op1 = map_reg(parts[0])
             op2 = map_operand(parts[1])
@@ -340,10 +564,12 @@ def transpile(input_elf, output_asm):
             asm_out.append(f"    sub {dst}, {dst}, #1")
         elif mnem == 'push':
             src = map_reg(parts[0])
-            asm_out.append(f"    str {src}, [sp, #-16]!")
+            src_x = to_x_reg(src)
+            asm_out.append(f"    str {src_x}, [x28, #-8]!")
         elif mnem == 'pop':
             dst = map_reg(parts[0])
-            asm_out.append(f"    ldr {dst}, [sp], #16")
+            dst_x = to_x_reg(dst)
+            asm_out.append(f"    ldr {dst_x}, [x28], #8")
         elif mnem == 'jmp':
             t = parts[0].split()[0].strip()
             if t.startswith('0x') or t.isdigit():
@@ -375,6 +601,22 @@ def transpile(input_elf, output_asm):
             t = parts[0].split()[0].strip()
             t_val = int(t, 16) if t.startswith('0x') else int(t)
             asm_out.append(f"    b.ge loc_{t_val:x}")
+        elif mnem in ('ja', 'jnbe'):
+            t = parts[0].split()[0].strip()
+            t_val = int(t, 16) if t.startswith('0x') else int(t)
+            asm_out.append(f"    b.hi loc_{t_val:x}")
+        elif mnem in ('jae', 'jnb'):
+            t = parts[0].split()[0].strip()
+            t_val = int(t, 16) if t.startswith('0x') else int(t)
+            asm_out.append(f"    b.hs loc_{t_val:x}")
+        elif mnem in ('jb', 'jnae'):
+            t = parts[0].split()[0].strip()
+            t_val = int(t, 16) if t.startswith('0x') else int(t)
+            asm_out.append(f"    b.lo loc_{t_val:x}")
+        elif mnem in ('jbe', 'jna'):
+            t = parts[0].split()[0].strip()
+            t_val = int(t, 16) if t.startswith('0x') else int(t)
+            asm_out.append(f"    b.ls loc_{t_val:x}")
         elif mnem in ('js',):
             t = parts[0].split()[0].strip()
             t_val = int(t, 16) if t.startswith('0x') else int(t)

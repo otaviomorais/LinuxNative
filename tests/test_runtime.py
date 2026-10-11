@@ -434,6 +434,58 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(res_exec.returncode, 77)
         self.assertEqual(res_exec.stdout, b"AOT_X86_TO_ARM64_PASSED\n")
 
+    def test_x86_to_arm64_real_c_program(self):
+        transpiler = Path(__file__).resolve().parent.parent / "tools" / "x86_transpile.py"
+        if not transpiler.exists():
+            self.skipTest("x86 transpiler tool not found")
+
+        c_src = self.directory / "real_prog.c"
+        x86_elf = self.directory / "real_x86.elf"
+        arm_elf = self.directory / "real_arm.elf"
+
+        c_src.write_text(
+            "typedef unsigned long size_t;\n"
+            "static void sys_print(const char *s) {\n"
+            "    size_t len = 0;\n"
+            "    while (s[len]) len++;\n"
+            "    register long rax __asm__(\"rax\") = 1;\n"
+            "    register long rdi __asm__(\"rdi\") = 1;\n"
+            "    register const char *rsi __asm__(\"rsi\") = s;\n"
+            "    register size_t rdx __asm__(\"rdx\") = len;\n"
+            "    __asm__ volatile(\"syscall\" : \"+r\"(rax) : \"r\"(rdi), \"r\"(rsi), \"r\"(rdx) : \"rcx\", \"r11\", \"memory\");\n"
+            "}\n"
+            "static void bubble_sort(int *a, int n) {\n"
+            "    for (int i = 0; i < n - 1; i++)\n"
+            "        for (int j = 0; j < n - i - 1; j++)\n"
+            "            if (a[j] > a[j + 1]) { int t = a[j]; a[j] = a[j + 1]; a[j + 1] = t; }\n"
+            "}\n"
+            "void _start(void) {\n"
+            "    int data[5] = {50, 10, 40, 20, 30};\n"
+            "    bubble_sort(data, 5);\n"
+            "    if (data[0] == 10 && data[4] == 50) {\n"
+            "        sys_print(\"BUBBLE_SORT_PASSED\\n\");\n"
+            "    }\n"
+            "    register long rax __asm__(\"rax\") = 60;\n"
+            "    register long rdi __asm__(\"rdi\") = 42;\n"
+            "    __asm__ volatile(\"syscall\" : \"+r\"(rax) : \"r\"(rdi) : \"memory\");\n"
+            "}\n"
+        )
+
+        res_cc = subprocess.run([
+            "clang", "--target=x86_64-linux-gnu", "-O2", "-ffreestanding",
+            "-fno-builtin", "-mno-sse", "-nostdlib", "-static",
+            str(c_src), "-o", str(x86_elf)
+        ], capture_output=True)
+        if res_cc.returncode != 0:
+            self.skipTest("clang x86_64 target compilation unavailable")
+
+        subprocess.run(["python3", str(transpiler), str(x86_elf), "-o", str(arm_elf)], check=True)
+        self.assertTrue(arm_elf.exists())
+
+        res_exec = subprocess.run([str(arm_elf)], capture_output=True)
+        self.assertEqual(res_exec.returncode, 42)
+        self.assertEqual(res_exec.stdout, b"BUBBLE_SORT_PASSED\n")
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
