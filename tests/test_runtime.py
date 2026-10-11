@@ -391,6 +391,48 @@ class RuntimeTests(unittest.TestCase):
         self.assertEqual(res_bash.returncode, 0, res_bash.stderr.decode())
         self.assertEqual(res_bash.stdout, b"42\n")
 
+    def test_x86_to_arm64_aot_transpiler(self):
+        transpiler = PROJECT / "tools/x86_transpile.py"
+        if not transpiler.exists():
+            self.skipTest("transpiler tool not found")
+        
+        # 1. Create a self-contained x86_64 test binary
+        x86_src = self.directory / "test.s"
+        x86_o = self.directory / "test.o"
+        x86_elf = self.directory / "test_x86.elf"
+        arm_elf = self.directory / "test_arm.elf"
+        
+        x86_src.write_text(
+            ".global _start\n"
+            ".section .rodata\n"
+            "msg: .ascii \"AOT_X86_TO_ARM64_PASSED\\n\"\n"
+            ".set msg_len, . - msg\n"
+            ".section .text\n"
+            "_start:\n"
+            "  mov $1, %rax\n"
+            "  mov $1, %rdi\n"
+            "  lea msg(%rip), %rsi\n"
+            "  mov $msg_len, %rdx\n"
+            "  syscall\n"
+            "  mov $77, %rdi\n"
+            "  mov $60, %rax\n"
+            "  syscall\n"
+        )
+        
+        # Assemble & link x86_64 binary
+        res_as = subprocess.run(["clang", "--target=x86_64-linux-gnu", "-c", str(x86_src), "-o", str(x86_o)], capture_output=True)
+        if res_as.returncode != 0:
+            self.skipTest("clang x86_64 target unavailable")
+        subprocess.run(["ld.lld", "-m", "elf_x86_64", str(x86_o), "-o", str(x86_elf)], check=True)
+        
+        # 2. Run AOT Transpiler: x86_64 ELF -> ARM64 native ELF
+        subprocess.run(["python3", str(transpiler), str(x86_elf), "-o", str(arm_elf)], check=True)
+        self.assertTrue(arm_elf.exists())
+        
+        # 3. Direct native execution on device (zero emulators)
+        res_exec = subprocess.run([str(arm_elf)], capture_output=True)
+        self.assertEqual(res_exec.returncode, 77)
+        self.assertEqual(res_exec.stdout, b"AOT_X86_TO_ARM64_PASSED\n")
 
 
 if __name__ == "__main__":
